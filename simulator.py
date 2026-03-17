@@ -1,4 +1,4 @@
-from cache_controller import CacheController, State, RequestType
+from cache_controller import CacheController, State, RequestType, Policy
 from memory import Memory
 from cpu import CPU
 
@@ -34,8 +34,13 @@ def state_str(state):
 
 class Simulator:
     def __init__(self, num_cache_lines=8, block_size=4, addr_bits=16,
-                 mem_read_latency=3, mem_write_latency=2, verbose=True):
-        self.cache_ctrl = CacheController(num_cache_lines, block_size, addr_bits)
+                 mem_read_latency=3, mem_write_latency=2,
+                 associativity=1, policy=Policy.DIRECT,
+                 verbose=True):
+        self.cache_ctrl = CacheController(
+            num_cache_lines, block_size, addr_bits,
+            associativity=associativity, policy=policy,
+        )
         self.memory = Memory(
             size=2**addr_bits,
             block_size=block_size,
@@ -53,8 +58,8 @@ class Simulator:
     def run(self, requests, label="Simulation"):
         self.cpu.load_requests(requests)
         self.cache_ctrl.cycle = 0
-        self.cache_ctrl.log = []
-        self._mem_op_started = False
+        self.cache_ctrl.log   = []
+        self._mem_op_started  = False
 
         if self.verbose:
             self._print_header(label)
@@ -92,12 +97,14 @@ class Simulator:
 
             state_stable = (prev_state == curr_state)
 
-            if curr_state == State.WRITE_BACK and state_stable and not self._mem_op_started and not self.memory.busy:
+            if (curr_state == State.WRITE_BACK and state_stable
+                    and not self._mem_op_started and not self.memory.busy):
                 self.memory.start_write(self.cache_ctrl.mem.address,
                                         self.cache_ctrl.mem.data_out)
                 self._mem_op_started = True
 
-            elif curr_state == State.ALLOCATE and state_stable and not self._mem_op_started and not self.memory.busy:
+            elif (curr_state == State.ALLOCATE and state_stable
+                  and not self._mem_op_started and not self.memory.busy):
                 self.memory.start_read(self.cache_ctrl.mem.address)
                 self._mem_op_started = True
 
@@ -111,10 +118,10 @@ class Simulator:
             self._print_results()
 
         return {
-            "stats": self.cache_ctrl.get_stats(),
+            "stats":   self.cache_ctrl.get_stats(),
             "results": self.cpu.results,
-            "log": self.cache_ctrl.log,
-            "cache": self.cache_ctrl.get_cache_snapshot(),
+            "log":     self.cache_ctrl.log,
+            "cache":   self.cache_ctrl.get_cache_snapshot(),
         }
 
     def _print_header(self, label):
@@ -128,16 +135,23 @@ class Simulator:
 
     def _print_config(self):
         ctrl = self.cache_ctrl
+        assoc_str = (f"{ctrl.associativity}-way Set-Associative"
+                     if ctrl.associativity > 1 else "Direct-Mapped")
+        policy_str = ctrl.policy.value
+
         print(f"\n  {colorize('Configuration:', 'BOLD')}")
         print(f"    Cache Lines : {ctrl.num_lines}    "
               f"Block Size : {ctrl.block_size} words    "
               f"Address Bits : {ctrl.addr_bits}")
+        print(f"    Associativity: {assoc_str}    "
+              f"Sets: {ctrl.num_sets}    "
+              f"Replacement: {policy_str}")
         print(f"    Tag Bits    : {ctrl.tag_bits}    "
               f"Index Bits : {ctrl.index_bits}        "
               f"Offset Bits  : {ctrl.offset_bits}")
         print(f"    Memory Read Latency  : {self.memory.read_latency} cycles")
         print(f"    Memory Write Latency : {self.memory.write_latency} cycles")
-        print(f"    Policy: Write-Back, Write-Allocate, Direct-Mapped")
+        print(f"    Write Policy: Write-Back, Write-Allocate")
         self._print_separator()
         print(f"  {'Cycle':>5}  {'State Transition':^32}  "
               f"{'Event':<22}  {'Signals & Details'}")
@@ -152,9 +166,9 @@ class Simulator:
             return
 
         for entry in log_entries:
-            prev = entry["prev_state"]
-            curr = entry["state"]
-            event = entry["event"]
+            prev   = entry["prev_state"]
+            curr   = entry["state"]
+            event  = entry["event"]
             details = entry["details"]
 
             prev_s = State(prev)
@@ -180,7 +194,7 @@ class Simulator:
             signals = " ".join(sig_parts)
 
             event_color = "WHITE"
-            if "HIT" in event:
+            if "HIT"  in event:
                 event_color = "GREEN"
             elif "MISS" in event:
                 event_color = "RED"
@@ -199,19 +213,31 @@ class Simulator:
                 print(f"         Signals: [{signals}]")
 
     def _print_cache_state(self):
+        ctrl = self.cache_ctrl
         print(f"\n  {colorize('Final Cache State:', 'BOLD')}")
-        print(f"    {'Idx':>3}  {'V':>1}  {'D':>1}  {'Tag':>6}  {'Data'}")
-        print(f"    {'---':>3}  {'-':>1}  {'-':>1}  {'------':>6}  {'----'}")
-        for line in self.cache_ctrl.get_cache_snapshot():
+        if ctrl.associativity > 1:
+            print(f"    {'Set':>3}  {'Way':>3}  {'V':>1}  {'D':>1}  "
+                  f"{'Tag':>6}  {'Data'}")
+            print(f"    {'---':>3}  {'---':>3}  {'-':>1}  {'-':>1}  "
+                  f"{'------':>6}  {'----'}")
+        else:
+            print(f"    {'Idx':>3}  {'V':>1}  {'D':>1}  {'Tag':>6}  {'Data'}")
+            print(f"    {'---':>3}  {'-':>1}  {'-':>1}  {'------':>6}  {'----'}")
+
+        for line in ctrl.get_cache_snapshot():
             v = colorize("1", "GREEN") if line["valid"] else colorize("0", "DIM")
-            d = colorize("1", "RED") if line["dirty"] else colorize("0", "DIM")
-            tag = colorize(line["tag"], "CYAN") if line["valid"] else colorize(line["tag"], "DIM")
+            d = colorize("1", "RED")   if line["dirty"] else colorize("0", "DIM")
+            tag = (colorize(line["tag"], "CYAN") if line["valid"]
+                   else colorize(line["tag"], "DIM"))
             data_str = " ".join(line["data"])
-            if line["valid"]:
-                data_str = colorize(data_str, "WHITE")
+            data_str = (colorize(data_str, "WHITE") if line["valid"]
+                        else colorize(data_str, "DIM"))
+
+            if ctrl.associativity > 1:
+                print(f"    {line['set']:>3}  {line['way']:>3}  {v}  {d}  "
+                      f"{tag:>6}  [{data_str}]")
             else:
-                data_str = colorize(data_str, "DIM")
-            print(f"    {line['index']:>3}  {v}  {d}  {tag:>6}  [{data_str}]")
+                print(f"    {line['set']:>3}  {v}  {d}  {tag:>6}  [{data_str}]")
 
     def _print_stats(self):
         stats = self.cache_ctrl.get_stats()

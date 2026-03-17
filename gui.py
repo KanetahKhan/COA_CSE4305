@@ -4,11 +4,12 @@ Cache Controller FSM Simulator — GUI Version
 =============================================
 Tkinter-based visual simulator showing:
   - FSM state diagram with live transitions
-  - Cache table with valid/dirty/tag/data
+  - Cache table with set/way/valid/dirty/tag/data
   - CPU and Memory interface signals
   - Cycle-by-cycle stepping or auto-run
   - Request queue management
   - Event log
+  - Configurable associativity (1/2/4/8-way) and replacement policy (LRU/LFU/Random)
 """
 
 import tkinter as tk
@@ -19,7 +20,7 @@ import os
 sys.path.insert(0, os.path.dirname(__file__))
 
 import math
-from cache_controller import CacheController, State, RequestType
+from cache_controller import CacheController, State, RequestType, Policy
 from memory import Memory
 from cpu import CPU
 
@@ -31,22 +32,30 @@ STATE_COLORS = {
     State.ALLOCATE:    "#FF9800",
 }
 
-STATE_POSITIONS = {
-    State.IDLE:        (150, 60),
-    State.COMPARE_TAG: (150, 180),
-    State.ALLOCATE:    (300, 300),
-    State.WRITE_BACK:  (0, 300),
-}
-
-BG_COLOR = "#1e1e2e"
-PANEL_BG = "#2a2a3d"
+BG_COLOR  = "#1e1e2e"
+PANEL_BG  = "#2a2a3d"
 TEXT_COLOR = "#cdd6f4"
-ACCENT = "#89b4fa"
-GREEN = "#a6e3a1"
-RED = "#f38ba8"
-YELLOW = "#f9e2af"
-CYAN = "#89dceb"
-DIM = "#6c7086"
+ACCENT    = "#89b4fa"
+GREEN     = "#a6e3a1"
+RED       = "#f38ba8"
+YELLOW    = "#f9e2af"
+CYAN      = "#89dceb"
+DIM       = "#6c7086"
+
+ASSOC_OPTIONS  = ["1 (Direct)", "2-way", "4-way", "8-way (Fully Assoc.)"]
+POLICY_OPTIONS = ["LRU", "LFU", "Random"]
+
+_ASSOC_MAP = {
+    "1 (Direct)":          1,
+    "2-way":               2,
+    "4-way":               4,
+    "8-way (Fully Assoc.)": 8,
+}
+_POLICY_MAP = {
+    "LRU":    Policy.LRU,
+    "LFU":    Policy.LFU,
+    "Random": Policy.RANDOM,
+}
 
 
 class SimulatorGUI:
@@ -54,76 +63,104 @@ class SimulatorGUI:
         self.root = root
         self.root.title("Cache Controller FSM Simulator")
         self.root.configure(bg=BG_COLOR)
-        self.root.geometry("1280x820")
-        self.root.minsize(1100, 750)
+        self.root.geometry("1300x860")
+        self.root.minsize(1100, 780)
 
-        self.cache_ctrl = CacheController(num_lines=8, block_size=4, addr_bits=16)
-        self.memory = Memory(size=65536, block_size=4, read_latency=3, write_latency=2)
-        self.cpu = CPU()
+        # Simulation state
+        self.cycle           = 0
+        self.running         = False
+        self.speed           = 500
+        self.request_list    = []
         self._mem_op_started = False
 
-        self.cycle = 0
-        self.running = False
-        self.speed = 500
-
-        self.request_list = []
+        # Preset scenarios
         self.preset_requests = {
             "Read Miss → Hit": [
-                (RequestType.READ, 0x0100, 0),
-                (RequestType.READ, 0x0101, 0),
+                (RequestType.READ,  0x0100, 0),
+                (RequestType.READ,  0x0101, 0),
             ],
             "Write-Allocate": [
                 (RequestType.WRITE, 0x0202, 0xFF),
-                (RequestType.READ, 0x0202, 0),
-                (RequestType.READ, 0x0200, 0),
+                (RequestType.READ,  0x0202, 0),
+                (RequestType.READ,  0x0200, 0),
             ],
             "Dirty Eviction": [
                 (RequestType.WRITE, 0x0001, 0xEE),
-                (RequestType.READ, 0x0100, 0),
+                (RequestType.READ,  0x0100, 0),
             ],
             "Clean Eviction": [
-                (RequestType.READ, 0x0000, 0),
-                (RequestType.READ, 0x0100, 0),
+                (RequestType.READ,  0x0000, 0),
+                (RequestType.READ,  0x0100, 0),
             ],
             "Write + Readback": [
                 (RequestType.WRITE, 0x0000, 0xA1),
                 (RequestType.WRITE, 0x0004, 0xB2),
                 (RequestType.WRITE, 0x0008, 0xC3),
-                (RequestType.READ, 0x0000, 0),
-                (RequestType.READ, 0x0004, 0),
-                (RequestType.READ, 0x0008, 0),
+                (RequestType.READ,  0x0000, 0),
+                (RequestType.READ,  0x0004, 0),
+                (RequestType.READ,  0x0008, 0),
             ],
             "Stress Test": [
                 (RequestType.WRITE, 0x0000, 0xF0),
                 (RequestType.WRITE, 0x0100, 0xF1),
-                (RequestType.READ, 0x0200, 0),
-                (RequestType.READ, 0x0000, 0),
+                (RequestType.READ,  0x0200, 0),
+                (RequestType.READ,  0x0000, 0),
                 (RequestType.WRITE, 0x0000, 0xAA),
-                (RequestType.READ, 0x0100, 0),
+                (RequestType.READ,  0x0100, 0),
             ],
         }
 
-        self._init_memory_data()
         self._build_ui()
-        self._draw_fsm()
-        self._update_cache_table()
-        self._update_signals()
+        self._create_sim_objects()
+        self._init_memory_data()
+        self._refresh_all()
+
+    # ------------------------------------------------------------------
+    # Simulation object creation (called on every reset)
+    # ------------------------------------------------------------------
+
+    def _current_associativity(self):
+        return _ASSOC_MAP.get(self.assoc_var.get(), 1)
+
+    def _current_policy(self):
+        assoc = self._current_associativity()
+        if assoc == 1:
+            return Policy.DIRECT
+        return _POLICY_MAP.get(self.policy_var.get(), Policy.LRU)
+
+    def _create_sim_objects(self):
+        assoc  = self._current_associativity()
+        policy = self._current_policy()
+
+        self.cache_ctrl      = CacheController(
+            num_lines=8, block_size=4, addr_bits=16,
+            associativity=assoc, policy=policy,
+        )
+        self.memory          = Memory(size=65536, block_size=4,
+                                      read_latency=3, write_latency=2)
+        self.cpu             = CPU()
+        self._mem_op_started = False
+        self.cycle           = 0
 
     def _init_memory_data(self):
         self.memory.init_region(0x0000, [0x11, 0x22, 0x33, 0x44])
         self.memory.init_region(0x0100, [0xAA, 0xBB, 0xCC, 0xDD])
         self.memory.init_region(0x0200, [0x10, 0x20, 0x30, 0x40])
 
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+
     def _build_ui(self):
         style = ttk.Style()
         style.theme_use("clam")
-        style.configure("Dark.TFrame", background=BG_COLOR)
+        style.configure("Dark.TFrame",  background=BG_COLOR)
         style.configure("Panel.TFrame", background=PANEL_BG)
-        style.configure("Dark.TLabel", background=BG_COLOR, foreground=TEXT_COLOR,
+        style.configure("Dark.TLabel",  background=BG_COLOR,  foreground=TEXT_COLOR,
                         font=("Consolas", 10))
         style.configure("Title.TLabel", background=PANEL_BG, foreground=ACCENT,
                         font=("Consolas", 11, "bold"))
-        style.configure("Dark.TButton", font=("Consolas", 10))
+        style.configure("Dark.TButton",   font=("Consolas", 10))
         style.configure("Dark.TCombobox", font=("Consolas", 10))
 
         main = ttk.Frame(self.root, style="Dark.TFrame")
@@ -156,18 +193,18 @@ class SimulatorGUI:
         self._build_log_panel(right_bot)
 
     def _build_fsm_panel(self, parent):
-        ttk.Label(parent, text=" FSM State Diagram", style="Title.TLabel").pack(
-            anchor=tk.W, padx=8, pady=(8, 2))
+        ttk.Label(parent, text=" FSM State Diagram",
+                  style="Title.TLabel").pack(anchor=tk.W, padx=8, pady=(8, 2))
         self.fsm_canvas = tk.Canvas(parent, bg="#1a1a2e", highlightthickness=0,
-                                     height=380, width=420)
+                                    height=380, width=420)
         self.fsm_canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=(2, 8))
 
     def _build_signals_panel(self, parent):
         frame = ttk.Frame(parent, style="Panel.TFrame")
         frame.pack(fill=tk.X, pady=(0, 4))
 
-        ttk.Label(frame, text=" Interface Signals", style="Title.TLabel").pack(
-            anchor=tk.W, padx=8, pady=(8, 4))
+        ttk.Label(frame, text=" Interface Signals",
+                  style="Title.TLabel").pack(anchor=tk.W, padx=8, pady=(8, 4))
 
         sig_frame = ttk.Frame(frame, style="Panel.TFrame")
         sig_frame.pack(fill=tk.X, padx=8, pady=(0, 8))
@@ -201,85 +238,145 @@ class SimulatorGUI:
         frame = ttk.Frame(parent, style="Panel.TFrame")
         frame.pack(fill=tk.X, pady=(4, 0))
 
-        ttk.Label(frame, text=" Controls", style="Title.TLabel").pack(
-            anchor=tk.W, padx=8, pady=(8, 4))
+        ttk.Label(frame, text=" Controls",
+                  style="Title.TLabel").pack(anchor=tk.W, padx=8, pady=(8, 4))
 
+        # Row 1 — cycle counter + stats
         row1 = ttk.Frame(frame, style="Panel.TFrame")
         row1.pack(fill=tk.X, padx=8, pady=2)
 
         self.cycle_label = tk.Label(row1, text="Cycle: 0", bg=PANEL_BG, fg=ACCENT,
-                                     font=("Consolas", 14, "bold"))
+                                    font=("Consolas", 14, "bold"))
         self.cycle_label.pack(side=tk.LEFT, padx=(0, 16))
 
-        self.stats_label = tk.Label(row1, text="Hits: 0 | Misses: 0 | Rate: —",
-                                     bg=PANEL_BG, fg=TEXT_COLOR, font=("Consolas", 10))
+        self.stats_label = tk.Label(row1,
+                                    text="Hits: 0 | Misses: 0 | Rate: —",
+                                    bg=PANEL_BG, fg=TEXT_COLOR,
+                                    font=("Consolas", 10))
         self.stats_label.pack(side=tk.LEFT)
 
+        # Row 2 — step / run / reset + speed
         row2 = ttk.Frame(frame, style="Panel.TFrame")
         row2.pack(fill=tk.X, padx=8, pady=(4, 4))
 
         self.step_btn = tk.Button(row2, text="⏵ Step", command=self._step,
-                                   bg="#45475a", fg=TEXT_COLOR, font=("Consolas", 10, "bold"),
-                                   relief=tk.FLAT, padx=12, pady=4)
+                                  bg="#45475a", fg=TEXT_COLOR,
+                                  font=("Consolas", 10, "bold"),
+                                  relief=tk.FLAT, padx=12, pady=4)
         self.step_btn.pack(side=tk.LEFT, padx=(0, 4))
 
         self.run_btn = tk.Button(row2, text="▶ Run", command=self._toggle_run,
-                                  bg="#45475a", fg=GREEN, font=("Consolas", 10, "bold"),
-                                  relief=tk.FLAT, padx=12, pady=4)
+                                 bg="#45475a", fg=GREEN,
+                                 font=("Consolas", 10, "bold"),
+                                 relief=tk.FLAT, padx=12, pady=4)
         self.run_btn.pack(side=tk.LEFT, padx=(0, 4))
 
         self.reset_btn = tk.Button(row2, text="↺ Reset", command=self._reset,
-                                    bg="#45475a", fg=RED, font=("Consolas", 10, "bold"),
-                                    relief=tk.FLAT, padx=12, pady=4)
+                                   bg="#45475a", fg=RED,
+                                   font=("Consolas", 10, "bold"),
+                                   relief=tk.FLAT, padx=12, pady=4)
         self.reset_btn.pack(side=tk.LEFT, padx=(0, 12))
 
         tk.Label(row2, text="Speed:", bg=PANEL_BG, fg=DIM,
                  font=("Consolas", 9)).pack(side=tk.LEFT)
-        self.speed_scale = tk.Scale(row2, from_=50, to=1000, orient=tk.HORIZONTAL,
-                                     bg=PANEL_BG, fg=TEXT_COLOR, troughcolor="#45475a",
-                                     highlightthickness=0, font=("Consolas", 8),
-                                     length=120, command=self._update_speed)
+        self.speed_scale = tk.Scale(row2, from_=50, to=1000,
+                                    orient=tk.HORIZONTAL,
+                                    bg=PANEL_BG, fg=TEXT_COLOR,
+                                    troughcolor="#45475a",
+                                    highlightthickness=0,
+                                    font=("Consolas", 8), length=120,
+                                    command=self._update_speed)
         self.speed_scale.set(500)
         self.speed_scale.pack(side=tk.LEFT, padx=4)
 
+        # Row 3 — associativity + policy selectors
         row3 = ttk.Frame(frame, style="Panel.TFrame")
-        row3.pack(fill=tk.X, padx=8, pady=(0, 8))
+        row3.pack(fill=tk.X, padx=8, pady=(0, 4))
 
-        tk.Label(row3, text="Preset:", bg=PANEL_BG, fg=DIM,
+        tk.Label(row3, text="Assoc:", bg=PANEL_BG, fg=DIM,
+                 font=("Consolas", 9)).pack(side=tk.LEFT)
+
+        self.assoc_var = tk.StringVar(value="1 (Direct)")
+        assoc_combo = ttk.Combobox(row3, textvariable=self.assoc_var,
+                                   values=ASSOC_OPTIONS, state="readonly", width=18)
+        assoc_combo.pack(side=tk.LEFT, padx=(2, 10))
+        assoc_combo.bind("<<ComboboxSelected>>", self._on_assoc_change)
+
+        tk.Label(row3, text="Policy:", bg=PANEL_BG, fg=DIM,
+                 font=("Consolas", 9)).pack(side=tk.LEFT)
+
+        self.policy_var = tk.StringVar(value="LRU")
+        self.policy_combo = ttk.Combobox(row3, textvariable=self.policy_var,
+                                         values=POLICY_OPTIONS, state="disabled",
+                                         width=10)
+        self.policy_combo.pack(side=tk.LEFT, padx=(2, 0))
+
+        # Row 4 — preset selector
+        row4 = ttk.Frame(frame, style="Panel.TFrame")
+        row4.pack(fill=tk.X, padx=8, pady=(0, 8))
+
+        tk.Label(row4, text="Preset:", bg=PANEL_BG, fg=DIM,
                  font=("Consolas", 9)).pack(side=tk.LEFT)
         self.preset_var = tk.StringVar()
-        preset_combo = ttk.Combobox(row3, textvariable=self.preset_var,
-                                     values=list(self.preset_requests.keys()),
-                                     state="readonly", width=20)
+        preset_combo = ttk.Combobox(row4, textvariable=self.preset_var,
+                                    values=list(self.preset_requests.keys()),
+                                    state="readonly", width=20)
         preset_combo.pack(side=tk.LEFT, padx=4)
         preset_combo.bind("<<ComboboxSelected>>", self._load_preset)
 
-        self.load_btn = tk.Button(row3, text="Load", command=self._load_preset,
-                                   bg="#45475a", fg=TEXT_COLOR, font=("Consolas", 9),
-                                   relief=tk.FLAT, padx=8)
+        self.load_btn = tk.Button(row4, text="Load", command=self._load_preset,
+                                  bg="#45475a", fg=TEXT_COLOR,
+                                  font=("Consolas", 9),
+                                  relief=tk.FLAT, padx=8)
         self.load_btn.pack(side=tk.LEFT, padx=2)
+
+        # Config info label (shows current assoc + policy)
+        self.config_label = tk.Label(frame,
+                                     text=self._config_str(),
+                                     bg=PANEL_BG, fg=DIM,
+                                     font=("Consolas", 9), anchor=tk.W)
+        self.config_label.pack(fill=tk.X, padx=8, pady=(0, 4))
+
+    def _config_str(self):
+        assoc = self._current_associativity()
+        if assoc == 1:
+            return "Config: Direct-Mapped  |  8 lines  |  block=4  |  16-bit addr"
+        pol   = self.policy_var.get()
+        sets  = 8 // assoc
+        return (f"Config: {assoc}-way Set-Assoc  |  {sets} sets × {assoc} ways  |"
+                f"  Policy: {pol}  |  block=4  |  16-bit addr")
 
     def _build_cache_panel(self, parent):
         frame = ttk.Frame(parent, style="Panel.TFrame")
         frame.pack(fill=tk.BOTH, expand=True)
 
-        ttk.Label(frame, text=" Cache Contents", style="Title.TLabel").pack(
-            anchor=tk.W, padx=8, pady=(8, 4))
+        ttk.Label(frame, text=" Cache Contents",
+                  style="Title.TLabel").pack(anchor=tk.W, padx=8, pady=(8, 4))
 
-        cols = ("Index", "Valid", "Dirty", "Tag", "Block Data")
-        self.cache_tree = ttk.Treeview(frame, columns=cols, show="headings", height=8)
+        # Always use 6 columns; "Way" shows "—" in direct-mapped mode
+        cols = ("Set", "Way", "V", "D", "Tag", "Block Data")
+        self.cache_tree = ttk.Treeview(frame, columns=cols,
+                                       show="headings", height=8)
 
         style = ttk.Style()
-        style.configure("Treeview", background="#1a1a2e", foreground=TEXT_COLOR,
-                        fieldbackground="#1a1a2e", font=("Consolas", 10), rowheight=25)
-        style.configure("Treeview.Heading", background="#45475a", foreground=TEXT_COLOR,
+        style.configure("Treeview",
+                        background="#1a1a2e", foreground=TEXT_COLOR,
+                        fieldbackground="#1a1a2e",
+                        font=("Consolas", 10), rowheight=25)
+        style.configure("Treeview.Heading",
+                        background="#45475a", foreground=TEXT_COLOR,
                         font=("Consolas", 10, "bold"))
         style.map("Treeview", background=[("selected", "#45475a")])
 
-        widths = [50, 50, 50, 80, 280]
-        for col, w in zip(cols, widths):
+        col_widths = [50, 50, 30, 30, 70, 260]
+        for col, w in zip(cols, col_widths):
             self.cache_tree.heading(col, text=col)
             self.cache_tree.column(col, width=w, anchor=tk.CENTER)
+
+        # Tag colours for dirty / valid rows
+        self.cache_tree.tag_configure("dirty",   foreground=RED)
+        self.cache_tree.tag_configure("valid",   foreground=TEXT_COLOR)
+        self.cache_tree.tag_configure("invalid", foreground=DIM)
 
         self.cache_tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
 
@@ -287,8 +384,8 @@ class SimulatorGUI:
         frame = ttk.Frame(parent, style="Panel.TFrame")
         frame.pack(fill=tk.X, pady=(0, 4))
 
-        ttk.Label(frame, text=" Add Request", style="Title.TLabel").pack(
-            anchor=tk.W, padx=8, pady=(8, 4))
+        ttk.Label(frame, text=" Add Request",
+                  style="Title.TLabel").pack(anchor=tk.W, padx=8, pady=(8, 4))
 
         row = ttk.Frame(frame, style="Panel.TFrame")
         row.pack(fill=tk.X, padx=8, pady=(0, 4))
@@ -309,82 +406,92 @@ class SimulatorGUI:
         tk.Label(row2, text="Addr 0x", bg=PANEL_BG, fg=DIM,
                  font=("Consolas", 9)).pack(side=tk.LEFT)
         self.addr_entry = tk.Entry(row2, width=6, bg="#45475a", fg=TEXT_COLOR,
-                                    font=("Consolas", 10), insertbackground=TEXT_COLOR)
+                                   font=("Consolas", 10),
+                                   insertbackground=TEXT_COLOR)
         self.addr_entry.insert(0, "0000")
         self.addr_entry.pack(side=tk.LEFT, padx=4)
 
         tk.Label(row2, text="Data 0x", bg=PANEL_BG, fg=DIM,
                  font=("Consolas", 9)).pack(side=tk.LEFT, padx=(8, 0))
         self.data_entry = tk.Entry(row2, width=4, bg="#45475a", fg=TEXT_COLOR,
-                                    font=("Consolas", 10), insertbackground=TEXT_COLOR)
+                                   font=("Consolas", 10),
+                                   insertbackground=TEXT_COLOR)
         self.data_entry.insert(0, "00")
         self.data_entry.pack(side=tk.LEFT, padx=4)
 
-        self.add_btn = tk.Button(row2, text="+ Add", command=self._add_request,
-                                  bg="#45475a", fg=GREEN, font=("Consolas", 9, "bold"),
-                                  relief=tk.FLAT, padx=8)
+        self.add_btn = tk.Button(row2, text="+ Add",
+                                 command=self._add_request,
+                                 bg="#45475a", fg=GREEN,
+                                 font=("Consolas", 9, "bold"),
+                                 relief=tk.FLAT, padx=8)
         self.add_btn.pack(side=tk.LEFT, padx=4)
 
-        self.queue_label = tk.Label(frame, text="Queue: (empty)", bg=PANEL_BG, fg=DIM,
-                                     font=("Consolas", 9), anchor=tk.W, wraplength=500,
-                                     justify=tk.LEFT)
+        self.queue_label = tk.Label(frame, text="Queue: (empty)",
+                                    bg=PANEL_BG, fg=DIM,
+                                    font=("Consolas", 9), anchor=tk.W,
+                                    wraplength=500, justify=tk.LEFT)
         self.queue_label.pack(fill=tk.X, padx=8, pady=(0, 8))
 
     def _build_log_panel(self, parent):
         frame = ttk.Frame(parent, style="Panel.TFrame")
         frame.pack(fill=tk.BOTH, expand=True)
 
-        ttk.Label(frame, text=" Event Log", style="Title.TLabel").pack(
-            anchor=tk.W, padx=8, pady=(8, 2))
+        ttk.Label(frame, text=" Event Log",
+                  style="Title.TLabel").pack(anchor=tk.W, padx=8, pady=(8, 2))
 
         self.log_text = scrolledtext.ScrolledText(
-            frame, bg="#1a1a2e", fg=TEXT_COLOR, font=("Consolas", 9),
-            height=10, insertbackground=TEXT_COLOR, wrap=tk.WORD,
+            frame, bg="#1a1a2e", fg=TEXT_COLOR,
+            font=("Consolas", 9), height=10,
+            insertbackground=TEXT_COLOR, wrap=tk.WORD,
             relief=tk.FLAT, state=tk.DISABLED
         )
         self.log_text.pack(fill=tk.BOTH, expand=True, padx=8, pady=(2, 8))
 
-        self.log_text.tag_configure("hit", foreground=GREEN)
+        self.log_text.tag_configure("hit",  foreground=GREEN)
         self.log_text.tag_configure("miss", foreground=RED)
         self.log_text.tag_configure("info", foreground=CYAN)
         self.log_text.tag_configure("warn", foreground=YELLOW)
         self.log_text.tag_configure("done", foreground=GREEN)
-        self.log_text.tag_configure("dim", foreground=DIM)
+        self.log_text.tag_configure("dim",  foreground=DIM)
+
+    # ------------------------------------------------------------------
+    # FSM canvas
+    # ------------------------------------------------------------------
 
     def _draw_fsm(self):
         c = self.fsm_canvas
         c.delete("all")
 
-        w = c.winfo_width() or 420
+        w = c.winfo_width()  or 420
         h = c.winfo_height() or 380
 
         ox = w * 0.5
         oy = h * 0.5
 
         positions = {
-            State.IDLE:        (ox, oy - 130),
-            State.COMPARE_TAG: (ox, oy - 20),
+            State.IDLE:        (ox,       oy - 130),
+            State.COMPARE_TAG: (ox,       oy - 20),
             State.WRITE_BACK:  (ox - 120, oy + 110),
             State.ALLOCATE:    (ox + 120, oy + 110),
         }
 
-        R = 42
+        R       = 42
         current = self.cache_ctrl.state
 
         arrows = [
-            (State.IDLE, State.COMPARE_TAG, "CPU valid", 10),
-            (State.COMPARE_TAG, State.WRITE_BACK, "Miss\n(dirty)", -20),
-            (State.COMPARE_TAG, State.ALLOCATE, "Miss\n(clean)", 20),
-            (State.WRITE_BACK, State.ALLOCATE, "Mem\nready", 0),
-            (State.ALLOCATE, State.IDLE, "Mem\nready", 10),
+            (State.IDLE,        State.COMPARE_TAG, "CPU valid",     10),
+            (State.COMPARE_TAG, State.WRITE_BACK,  "Miss\n(dirty)", -20),
+            (State.COMPARE_TAG, State.ALLOCATE,    "Miss\n(clean)",  20),
+            (State.WRITE_BACK,  State.ALLOCATE,    "Mem\nready",      0),
+            (State.ALLOCATE,    State.IDLE,         "Mem\nready",     10),
         ]
 
         for src, dst, label, offset in arrows:
             x1, y1 = positions[src]
             x2, y2 = positions[dst]
 
-            dx = x2 - x1
-            dy = y2 - y1
+            dx   = x2 - x1
+            dy   = y2 - y1
             dist = math.sqrt(dx*dx + dy*dy)
             if dist == 0:
                 continue
@@ -395,74 +502,110 @@ class SimulatorGUI:
             ex = x2 - ux * (R + 4)
             ey = y2 - uy * (R + 4)
 
-            is_active = (current == dst and self.cache_ctrl.prev_state == src)
+            is_active = (current == dst and
+                         self.cache_ctrl.prev_state == src)
             color = "#f9e2af" if is_active else "#585b70"
-            width = 3 if is_active else 1.5
+            width = 3         if is_active else 1.5
 
             px = -uy * offset
-            py = ux * offset
+            py =  ux * offset
             mx = (sx + ex) / 2 + px
             my = (sy + ey) / 2 + py
 
             c.create_line(sx, sy, mx, my, ex, ey, smooth=True,
-                         fill=color, width=width, arrow=tk.LAST, arrowshape=(10, 12, 5))
+                          fill=color, width=width,
+                          arrow=tk.LAST, arrowshape=(10, 12, 5))
 
             lx = mx + (-uy) * 18
-            ly = my + ux * 18
+            ly = my +  ux  * 18
             c.create_text(lx, ly, text=label, fill=color,
-                         font=("Consolas", 7), justify=tk.CENTER)
+                          font=("Consolas", 7), justify=tk.CENTER)
 
+        # "Hit!" self-loop arrow on COMPARE_TAG → IDLE
         hit_x, hit_y = positions[State.COMPARE_TAG]
         is_hit = (current == State.IDLE and
                   self.cache_ctrl.prev_state == State.COMPARE_TAG and
                   self.cycle > 0)
         hit_color = "#a6e3a1" if is_hit else "#585b70"
-        hit_w = 3 if is_hit else 1.5
+        hit_w     = 3         if is_hit else 1.5
 
-        c.create_line(hit_x + R + 4, hit_y - 10,
-                     hit_x + R + 40, hit_y - 30,
-                     positions[State.IDLE][0] + R + 4, positions[State.IDLE][1] + 10,
-                     smooth=True, fill=hit_color, width=hit_w,
-                     arrow=tk.LAST, arrowshape=(10, 12, 5))
-        c.create_text(hit_x + R + 50, hit_y - 30, text="Hit!", fill=hit_color,
-                     font=("Consolas", 8, "bold"))
+        c.create_line(hit_x + R + 4,  hit_y - 10,
+                      hit_x + R + 40, hit_y - 30,
+                      positions[State.IDLE][0] + R + 4,
+                      positions[State.IDLE][1] + 10,
+                      smooth=True, fill=hit_color, width=hit_w,
+                      arrow=tk.LAST, arrowshape=(10, 12, 5))
+        c.create_text(hit_x + R + 50, hit_y - 30, text="Hit!",
+                      fill=hit_color, font=("Consolas", 8, "bold"))
 
+        # Draw state circles
         for state, (x, y) in positions.items():
             is_current = (state == current)
-            fill = STATE_COLORS[state] if is_current else "#313244"
+            fill    = STATE_COLORS[state] if is_current else "#313244"
             outline = STATE_COLORS[state]
-            width = 3 if is_current else 1.5
+            width   = 3 if is_current else 1.5
 
             c.create_oval(x - R, y - R, x + R, y + R,
-                         fill=fill, outline=outline, width=width)
+                          fill=fill, outline=outline, width=width)
 
             text_color = "#1e1e2e" if is_current else TEXT_COLOR
             c.create_text(x, y, text=state.value, fill=text_color,
-                         font=("Consolas", 9, "bold"))
+                          font=("Consolas", 9, "bold"))
 
             if is_current:
                 c.create_oval(x - R - 5, y - R - 5, x + R + 5, y + R + 5,
-                             outline=STATE_COLORS[state], width=1, dash=(3, 3))
+                              outline=STATE_COLORS[state], width=1, dash=(3, 3))
+
+        # Associativity / policy annotation
+        assoc  = self.cache_ctrl.associativity
+        policy = self.cache_ctrl.policy
+        if assoc == 1:
+            ann = "Direct-Mapped"
+        else:
+            ann = f"{assoc}-way  |  {policy.value}"
+        c.create_text(w - 8, h - 8, text=ann, anchor=tk.SE,
+                      fill=DIM, font=("Consolas", 8))
+
+    # ------------------------------------------------------------------
+    # Cache table update
+    # ------------------------------------------------------------------
 
     def _update_cache_table(self):
         for item in self.cache_tree.get_children():
             self.cache_tree.delete(item)
 
-        for line in self.cache_ctrl.get_cache_snapshot():
-            v = "1" if line["valid"] else "0"
-            d = "1" if line["dirty"] else "0"
+        ctrl  = self.cache_ctrl
+        assoc = ctrl.associativity
+
+        for line in ctrl.get_cache_snapshot():
+            v    = "1" if line["valid"] else "0"
+            d    = "1" if line["dirty"] else "0"
+            tag  = "—"  if not line["valid"] else line["tag"]
             data = " ".join(line["data"])
-            tag = "—" if v == "0" else line["tag"]
-            self.cache_tree.insert("", tk.END, values=(
-                line["index"], v, d, tag, data
-            ))
+            way  = str(line["way"]) if assoc > 1 else "—"
+
+            if line["valid"] and line["dirty"]:
+                row_tag = "dirty"
+            elif line["valid"]:
+                row_tag = "valid"
+            else:
+                row_tag = "invalid"
+
+            self.cache_tree.insert("", tk.END,
+                                   values=(line["set"], way, v, d, tag, data),
+                                   tags=(row_tag,))
+
+    # ------------------------------------------------------------------
+    # Signals panel update
+    # ------------------------------------------------------------------
 
     def _update_signals(self):
         ctrl = self.cache_ctrl
 
         def set_sig(name, value, active=False):
             color = GREEN if active else DIM
-            self.signal_labels[name].configure(text=f"  {name}: {value}", fg=color)
+            self.signal_labels[name].configure(
+                text=f"  {name}: {value}", fg=color)
 
         set_sig("cpu_valid", "1" if ctrl.cpu.valid else "0", ctrl.cpu.valid)
         rw = "—"
@@ -471,23 +614,27 @@ class SimulatorGUI:
         elif ctrl.cpu.read_write == RequestType.WRITE:
             rw = "WRITE"
         set_sig("cpu_rd_wr", rw, ctrl.cpu.valid)
-        set_sig("cpu_addr", f"0x{ctrl.cpu.address:04X}" if ctrl.cpu.valid else "—",
+        set_sig("cpu_addr",
+                f"0x{ctrl.cpu.address:04X}" if ctrl.cpu.valid else "—",
                 ctrl.cpu.valid)
-        set_sig("cpu_data", f"0x{ctrl.cpu.data_out:02X}" if ctrl.cpu.ready else "—",
+        set_sig("cpu_data",
+                f"0x{ctrl.cpu.data_out:02X}" if ctrl.cpu.ready else "—",
                 ctrl.cpu.ready)
         set_sig("cpu_ready", "1" if ctrl.cpu.ready else "0", ctrl.cpu.ready)
         set_sig("cpu_stall", "1" if ctrl.cpu.stall else "0", ctrl.cpu.stall)
 
-        set_sig("mem_read", "1" if ctrl.mem.read else "0", ctrl.mem.read)
+        set_sig("mem_read",  "1" if ctrl.mem.read  else "0", ctrl.mem.read)
         set_sig("mem_write", "1" if ctrl.mem.write else "0", ctrl.mem.write)
-        set_sig("mem_addr", f"0x{ctrl.mem.address:04X}" if (ctrl.mem.read or ctrl.mem.write) else "—",
+        set_sig("mem_addr",
+                f"0x{ctrl.mem.address:04X}"
+                if (ctrl.mem.read or ctrl.mem.write) else "—",
                 ctrl.mem.read or ctrl.mem.write)
         set_sig("mem_ready", "1" if ctrl.mem.ready else "0", ctrl.mem.ready)
 
     def _update_stats(self):
         stats = self.cache_ctrl.get_stats()
         self.cycle_label.configure(text=f"Cycle: {self.cycle}")
-        rate = stats["hit_rate"] if stats["total_requests"] else "—"
+        rate  = stats["hit_rate"] if stats["total_requests"] else "—"
         self.stats_label.configure(
             text=f"Hits: {stats['hits']} | Misses: {stats['misses']} | Rate: {rate}")
 
@@ -504,11 +651,27 @@ class SimulatorGUI:
                 parts.append(f"{t}(0x{addr:04X})")
         self.queue_label.configure(text="Queue: " + " → ".join(parts))
 
+    def _refresh_all(self):
+        self._draw_fsm()
+        self._update_cache_table()
+        self._update_signals()
+        self._update_stats()
+        self._update_queue_display()
+        self.config_label.configure(text=self._config_str())
+
+    # ------------------------------------------------------------------
+    # Event log
+    # ------------------------------------------------------------------
+
     def _log(self, message, tag="dim"):
         self.log_text.configure(state=tk.NORMAL)
         self.log_text.insert(tk.END, f"[{self.cycle:>4}] {message}\n", tag)
         self.log_text.see(tk.END)
         self.log_text.configure(state=tk.DISABLED)
+
+    # ------------------------------------------------------------------
+    # Simulation step
+    # ------------------------------------------------------------------
 
     def _step(self):
         if self.cpu.is_done() and self.cache_ctrl.state == State.IDLE:
@@ -537,36 +700,34 @@ class SimulatorGUI:
                 self.cache_ctrl.mem.data_in = list(self.memory.buffer)
             self._mem_op_started = False
 
-        prev_state = self.cache_ctrl.state
-        log_len_before = len(self.cache_ctrl.log)
+        prev_state      = self.cache_ctrl.state
+        log_len_before  = len(self.cache_ctrl.log)
         self.cache_ctrl.tick()
         curr_state = self.cache_ctrl.state
 
         if prev_state != curr_state:
             self._mem_op_started = False
 
-        if curr_state == State.WRITE_BACK and not self._mem_op_started and not self.memory.busy:
+        if (curr_state == State.WRITE_BACK
+                and not self._mem_op_started and not self.memory.busy):
             self.memory.start_write(self.cache_ctrl.mem.address,
                                     self.cache_ctrl.mem.data_out)
             self._mem_op_started = True
-        elif curr_state == State.ALLOCATE and not self._mem_op_started and not self.memory.busy:
+        elif (curr_state == State.ALLOCATE
+              and not self._mem_op_started and not self.memory.busy):
             self.memory.start_read(self.cache_ctrl.mem.address)
             self._mem_op_started = True
 
+        # Append new log entries to the event log widget
         for entry in self.cache_ctrl.log[log_len_before:]:
-            event = entry["event"]
+            event   = entry["event"]
             details = entry["details"]
-            tag = "dim"
-            if "HIT" in event:
-                tag = "hit"
-            elif "MISS" in event:
-                tag = "miss"
-            elif "DONE" in event:
-                tag = "done"
-            elif "WAIT" in event:
-                tag = "warn"
-            elif "REQUEST" in event:
-                tag = "info"
+            tag     = "dim"
+            if   "HIT"     in event: tag = "hit"
+            elif "MISS"    in event: tag = "miss"
+            elif "DONE"    in event: tag = "done"
+            elif "WAIT"    in event: tag = "warn"
+            elif "REQUEST" in event: tag = "info"
 
             transition = ""
             if entry["prev_state"] != entry["state"]:
@@ -579,7 +740,7 @@ class SimulatorGUI:
             if r["type"] == RequestType.READ:
                 self._log(f"  ↳ CPU received data: 0x{r['data_returned']:02X}", "done")
             else:
-                self._log(f"  ↳ Write complete", "done")
+                self._log("  ↳ Write complete", "done")
 
         self._draw_fsm()
         self._update_cache_table()
@@ -590,6 +751,10 @@ class SimulatorGUI:
             self._log("All requests completed!", "done")
             if self.running:
                 self._toggle_run()
+
+    # ------------------------------------------------------------------
+    # Run / pause / reset / speed
+    # ------------------------------------------------------------------
 
     def _toggle_run(self):
         if self.running:
@@ -614,12 +779,7 @@ class SimulatorGUI:
         self.running = False
         self.run_btn.configure(text="▶ Run", fg=GREEN)
 
-        self.cache_ctrl = CacheController(num_lines=8, block_size=4, addr_bits=16)
-        self.memory = Memory(size=65536, block_size=4, read_latency=3, write_latency=2)
-        self.cpu = CPU()
-        self._mem_op_started = False
-        self.cycle = 0
-
+        self._create_sim_objects()
         self._init_memory_data()
 
         if self.request_list:
@@ -629,26 +789,42 @@ class SimulatorGUI:
         self.log_text.delete("1.0", tk.END)
         self.log_text.configure(state=tk.DISABLED)
 
-        self._draw_fsm()
-        self._update_cache_table()
-        self._update_signals()
-        self._update_stats()
-        self._update_queue_display()
+        self._refresh_all()
         self._log("Simulator reset. Ready.", "info")
+
+    # ------------------------------------------------------------------
+    # Associativity / policy combo handlers
+    # ------------------------------------------------------------------
+
+    def _on_assoc_change(self, _event=None):
+        assoc = self._current_associativity()
+        if assoc == 1:
+            self.policy_combo.configure(state="disabled")
+        else:
+            self.policy_combo.configure(state="readonly")
+        # Auto-reset so the cache structure matches the new config
+        self._reset()
+
+    # ------------------------------------------------------------------
+    # Request management
+    # ------------------------------------------------------------------
 
     def _add_request(self):
         try:
             addr = int(self.addr_entry.get(), 16)
         except ValueError:
-            messagebox.showerror("Invalid Address", "Enter a valid hex address (e.g. 0100)")
+            messagebox.showerror("Invalid Address",
+                                 "Enter a valid hex address (e.g. 0100)")
             return
         try:
             data = int(self.data_entry.get(), 16)
         except ValueError:
-            messagebox.showerror("Invalid Data", "Enter a valid hex value (e.g. FF)")
+            messagebox.showerror("Invalid Data",
+                                 "Enter a valid hex value (e.g. FF)")
             return
 
-        rt = RequestType.READ if self.req_type_var.get() == "READ" else RequestType.WRITE
+        rt = (RequestType.READ if self.req_type_var.get() == "READ"
+              else RequestType.WRITE)
         self.request_list.append((rt, addr, data))
         self.cpu.add_request(rt, addr, data)
         self._update_queue_display()
@@ -668,7 +844,7 @@ class SimulatorGUI:
 
 def main():
     root = tk.Tk()
-    app = SimulatorGUI(root)
+    app  = SimulatorGUI(root)
     root.mainloop()
 
 
