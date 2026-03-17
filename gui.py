@@ -25,6 +25,7 @@ from cache_controller import CacheController, State, RequestType, Policy
 from memory import Memory
 from cpu import CPU
 from compare_window import CompareWindow
+from memory_window import MemoryWindow
 
 
 STATE_COLORS = {
@@ -81,6 +82,12 @@ class SimulatorGUI:
         self._log_items = []      # (line_text, tag) pairs mirroring the log widget
         self._hist_pos  = -1      # current position in _history
         self._scrubbing = False   # suppress re-entry in _on_scrub
+
+        # Memory map window state
+        self._mem_window       = None   # MemoryWindow toplevel (or None if closed)
+        self._mem_active_block = None   # CYAN — block CPU is currently accessing
+        self._mem_alloc_block  = None   # GREEN — last block fetched from memory
+        self._mem_wb_block     = None   # ORANGE — last block written back
 
         # Preset scenarios
         self.preset_requests = {
@@ -299,6 +306,11 @@ class SimulatorGUI:
 
         tk.Button(row2, text="⇌ Compare", command=self._open_compare,
                   bg="#45475a", fg=PURPLE,
+                  font=("Consolas", 10, "bold"),
+                  relief=tk.FLAT, padx=12, pady=4).pack(side=tk.LEFT, padx=(0, 4))
+
+        tk.Button(row2, text="🗺 Mem", command=self._open_memory_window,
+                  bg="#45475a", fg=CYAN,
                   font=("Consolas", 10, "bold"),
                   relief=tk.FLAT, padx=12, pady=4).pack(side=tk.LEFT, padx=(0, 12))
 
@@ -703,6 +715,7 @@ class SimulatorGUI:
         self._update_stats()
         self._update_queue_display()
         self.config_label.configure(text=self._config_str())
+        self._update_memory_window()
 
     # ------------------------------------------------------------------
     # Event log
@@ -773,6 +786,17 @@ class SimulatorGUI:
             self.memory.start_read(self.cache_ctrl.mem.address)
             self._mem_op_started = True
 
+        # ── memory map block tracking ─────────────────────────────────────────
+        bs = self.cache_ctrl.block_size
+        if self.cache_ctrl.cpu.valid:
+            self._mem_active_block = self.cache_ctrl.cpu.address & ~(bs - 1)
+        elif curr_state == State.IDLE:
+            self._mem_active_block = None
+        if curr_state == State.ALLOCATE and self.memory.ready:
+            self._mem_alloc_block = self.cache_ctrl.mem.address & ~(bs - 1)
+        if curr_state == State.WRITE_BACK and self.memory.ready:
+            self._mem_wb_block = self.cache_ctrl.mem.address & ~(bs - 1)
+
         for entry in self.cache_ctrl.log[log_len_before:]:
             event   = entry["event"]
             details = entry["details"]
@@ -800,6 +824,7 @@ class SimulatorGUI:
         self._update_cache_table()
         self._update_signals()
         self._update_stats()
+        self._update_memory_window()
 
         if self.cpu.is_done() and self.cache_ctrl.state == State.IDLE:
             self._log("All requests completed!", "done")
@@ -844,10 +869,13 @@ class SimulatorGUI:
         if self.request_list:
             self.cpu.load_requests(list(self.request_list))
 
-        # Wipe history and log
-        self._history   = []
-        self._log_items = []
-        self._hist_pos  = -1
+        # Wipe history, log, and memory tracking
+        self._history          = []
+        self._log_items        = []
+        self._hist_pos         = -1
+        self._mem_active_block = None
+        self._mem_alloc_block  = None
+        self._mem_wb_block     = None
 
         self.log_text.configure(state=tk.NORMAL)
         self.log_text.delete("1.0", tk.END)
@@ -865,6 +893,26 @@ class SimulatorGUI:
     # Associativity / policy combo handlers
     # ------------------------------------------------------------------
 
+    def _open_memory_window(self):
+        """Open (or bring to front) the memory map window."""
+        if self._mem_window is None or not self._mem_window.winfo_exists():
+            self._mem_window = MemoryWindow(self.root)
+        else:
+            self._mem_window.lift()
+        self._update_memory_window()
+
+    def _update_memory_window(self):
+        """Push current memory state to the memory map window if it is open."""
+        if self._mem_window is None or not self._mem_window.winfo_exists():
+            return
+        self._mem_window.update_display(
+            self.memory,
+            self.cache_ctrl.block_size,
+            self._mem_active_block,
+            self._mem_alloc_block,
+            self._mem_wb_block,
+        )
+
     def _open_compare(self):
         """Open the side-by-side policy comparison window."""
         CompareWindow(self.root, initial_requests=list(self.request_list))
@@ -876,22 +924,28 @@ class SimulatorGUI:
     def _take_snapshot(self):
         """Deep-copy all simulation state into a dict for later restore."""
         return {
-            "cache_ctrl":      copy.deepcopy(self.cache_ctrl),
-            "memory":          copy.deepcopy(self.memory),
-            "cpu":             copy.deepcopy(self.cpu),
-            "_mem_op_started": self._mem_op_started,
-            "cycle":           self.cycle,
-            "log_items":       list(self._log_items),   # shallow-copy; tuples are immutable
+            "cache_ctrl":        copy.deepcopy(self.cache_ctrl),
+            "memory":            copy.deepcopy(self.memory),
+            "cpu":               copy.deepcopy(self.cpu),
+            "_mem_op_started":   self._mem_op_started,
+            "cycle":             self.cycle,
+            "log_items":         list(self._log_items),   # shallow-copy; tuples are immutable
+            "mem_active_block":  self._mem_active_block,
+            "mem_alloc_block":   self._mem_alloc_block,
+            "mem_wb_block":      self._mem_wb_block,
         }
 
     def _restore_snapshot(self, snap):
         """Replace live simulation objects with the copies stored in snap."""
-        self.cache_ctrl      = snap["cache_ctrl"]
-        self.memory          = snap["memory"]
-        self.cpu             = snap["cpu"]
-        self._mem_op_started = snap["_mem_op_started"]
-        self.cycle           = snap["cycle"]
-        self._log_items      = list(snap["log_items"])
+        self.cache_ctrl          = snap["cache_ctrl"]
+        self.memory              = snap["memory"]
+        self.cpu                 = snap["cpu"]
+        self._mem_op_started     = snap["_mem_op_started"]
+        self.cycle               = snap["cycle"]
+        self._log_items          = list(snap["log_items"])
+        self._mem_active_block   = snap.get("mem_active_block")
+        self._mem_alloc_block    = snap.get("mem_alloc_block")
+        self._mem_wb_block       = snap.get("mem_wb_block")
 
         # Rebuild the log widget from the stored line/tag pairs
         self.log_text.configure(state=tk.NORMAL)
@@ -908,6 +962,7 @@ class SimulatorGUI:
         self._update_signals()
         self._update_stats()
         self._update_history_scrubber()
+        self._update_memory_window()
 
     def _step_back(self):
         """Go one cycle backward through recorded history."""
