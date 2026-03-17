@@ -89,6 +89,10 @@ class SimulatorGUI:
         self._mem_alloc_block  = None   # GREEN — last block fetched from memory
         self._mem_wb_block     = None   # ORANGE — last block written back
 
+        # Hit/Miss timeline state
+        self._timeline_entries = []     # completed requests: {req_type,addr,hit,start,end}
+        self._pending_req      = None   # in-flight: {req_type,addr,start} or None
+
         # Preset scenarios
         self.preset_requests = {
             "Read Miss → Hit": [
@@ -211,6 +215,10 @@ class SimulatorGUI:
 
         self._build_request_panel(right_bot)
         self._build_log_panel(right_bot)
+
+        timeline_outer = ttk.Frame(main, style="Panel.TFrame")
+        timeline_outer.pack(fill=tk.X, pady=(6, 0))
+        self._build_timeline_panel(timeline_outer)
 
     def _build_fsm_panel(self, parent):
         ttk.Label(parent, text=" FSM State Diagram",
@@ -716,6 +724,7 @@ class SimulatorGUI:
         self._update_queue_display()
         self.config_label.configure(text=self._config_str())
         self._update_memory_window()
+        self._update_timeline()
 
     # ------------------------------------------------------------------
     # Event log
@@ -757,6 +766,7 @@ class SimulatorGUI:
         if new_req is not None:
             req_type, addr, data = new_req
             self.cache_ctrl.submit_request(req_type, addr, data)
+            self._pending_req = {"req_type": req_type, "addr": addr, "start": self.cycle}
         elif not self.cpu.waiting_for_result:
             self.cache_ctrl.clear_request()
 
@@ -820,11 +830,25 @@ class SimulatorGUI:
             else:
                 self._log("  ↳ Write complete", "done")
 
+            # ── complete timeline entry ────────────────────────────────────────
+            if self._pending_req is not None:
+                new_entries = self.cache_ctrl.log[log_len_before:]
+                hit = any("HIT" in e["event"] for e in new_entries)
+                self._timeline_entries.append({
+                    "req_type": self._pending_req["req_type"],
+                    "addr":     self._pending_req["addr"],
+                    "hit":      hit,
+                    "start":    self._pending_req["start"],
+                    "end":      self.cycle,
+                })
+                self._pending_req = None
+
         self._draw_fsm()
         self._update_cache_table()
         self._update_signals()
         self._update_stats()
         self._update_memory_window()
+        self._update_timeline()
 
         if self.cpu.is_done() and self.cache_ctrl.state == State.IDLE:
             self._log("All requests completed!", "done")
@@ -869,13 +893,15 @@ class SimulatorGUI:
         if self.request_list:
             self.cpu.load_requests(list(self.request_list))
 
-        # Wipe history, log, and memory tracking
+        # Wipe history, log, memory tracking, and timeline
         self._history          = []
         self._log_items        = []
         self._hist_pos         = -1
         self._mem_active_block = None
         self._mem_alloc_block  = None
         self._mem_wb_block     = None
+        self._timeline_entries = []
+        self._pending_req      = None
 
         self.log_text.configure(state=tk.NORMAL)
         self.log_text.delete("1.0", tk.END)
@@ -892,6 +918,135 @@ class SimulatorGUI:
     # ------------------------------------------------------------------
     # Associativity / policy combo handlers
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Hit/Miss Timeline
+    # ------------------------------------------------------------------
+
+    def _build_timeline_panel(self, parent):
+        hdr = ttk.Frame(parent, style="Panel.TFrame")
+        hdr.pack(fill=tk.X, padx=8, pady=(8, 2))
+
+        ttk.Label(hdr, text=" Hit/Miss Timeline",
+                  style="Title.TLabel").pack(side=tk.LEFT)
+
+        for color, text in [
+            (GREEN,  "■ Hit"),
+            (RED,    "■ Miss"),
+            (CYAN,   "■ In-flight"),
+        ]:
+            tk.Label(hdr, text=text, bg=PANEL_BG, fg=color,
+                     font=("Consolas", 8)).pack(side=tk.RIGHT, padx=6)
+
+        self.timeline_canvas = tk.Canvas(
+            parent, bg="#0d0d1a", highlightthickness=0, height=82,
+        )
+        self.timeline_canvas.pack(fill=tk.X, padx=8, pady=(0, 8))
+        self.timeline_canvas.bind("<Configure>", lambda _e: self._update_timeline())
+
+    def _update_timeline(self):
+        c = self.timeline_canvas
+        c.delete("all")
+
+        w = c.winfo_width()  or 600
+        h = c.winfo_height() or 82
+
+        LEFT    = 10
+        RIGHT   = 10
+        BY1     = 14    # block top
+        BY2     = 56    # block bottom
+        AXIS_Y  = 64
+        TICK_H  = 5
+        MIN_BW  = 6     # minimum block pixel width
+
+        entries = self._timeline_entries
+
+        if not entries and self._pending_req is None:
+            c.create_text(w // 2, h // 2,
+                          text="No requests yet — step through a simulation",
+                          fill=DIM, font=("Consolas", 9))
+            return
+
+        # Total span: at least up to current cycle
+        total_end = max(
+            (max(e["end"] for e in entries) if entries else 0),
+            self.cycle,
+            1,
+        )
+
+        avail = w - LEFT - RIGHT
+        scale = avail / total_end          # pixels per cycle
+
+        # Axis arrow
+        c.create_line(LEFT, AXIS_Y, w - RIGHT, AXIS_Y, fill=DIM, width=1)
+        c.create_line(w - RIGHT,     AXIS_Y,
+                      w - RIGHT - 6, AXIS_Y - 3, fill=DIM, width=1)
+        c.create_line(w - RIGHT,     AXIS_Y,
+                      w - RIGHT - 6, AXIS_Y + 3, fill=DIM, width=1)
+
+        # Draw completed entries
+        prev_tick_x = -999
+        for entry in entries:
+            x1 = LEFT + entry["start"] * scale
+            x2 = LEFT + entry["end"]   * scale
+            x2 = max(x2, x1 + MIN_BW)
+
+            fill_color    = "#1a3a1a" if entry["hit"] else "#3a1a1a"
+            border_color  = GREEN    if entry["hit"] else RED
+
+            c.create_rectangle(x1, BY1, x2, BY2,
+                               fill=fill_color, outline=border_color, width=1)
+
+            bw = x2 - x1
+            rw = "R" if entry["req_type"] == RequestType.READ else "W"
+            cy = entry["end"] - entry["start"]
+            result = "HIT" if entry["hit"] else "MISS"
+
+            if bw >= 90:
+                label = f"{rw} 0x{entry['addr']:04X}\n{result} ({cy} cy)"
+            elif bw >= 50:
+                label = f"{rw} 0x{entry['addr']:04X}"
+            elif bw >= 24:
+                label = f"0x{entry['addr']:02X}"
+            else:
+                label = ""
+
+            if label:
+                c.create_text((x1 + x2) / 2, (BY1 + BY2) / 2,
+                              text=label, fill=border_color,
+                              font=("Consolas", 7), justify=tk.CENTER)
+
+            # Tick at start (suppress if too close to previous tick)
+            tx = LEFT + entry["start"] * scale
+            if tx - prev_tick_x >= 18:
+                c.create_line(tx, AXIS_Y, tx, AXIS_Y + TICK_H, fill=DIM, width=1)
+                c.create_text(tx, AXIS_Y + TICK_H + 2,
+                              text=str(entry["start"]),
+                              fill=DIM, font=("Consolas", 7), anchor=tk.N)
+                prev_tick_x = tx
+
+        # Draw in-flight block (dashed cyan)
+        if self._pending_req is not None:
+            x1 = LEFT + self._pending_req["start"] * scale
+            x2 = LEFT + self.cycle * scale
+            x2 = max(x2, x1 + MIN_BW)
+
+            c.create_rectangle(x1, BY1, x2, BY2,
+                               fill="#0d1f2d", outline=CYAN, width=1, dash=(4, 2))
+            rw = "R" if self._pending_req["req_type"] == RequestType.READ else "W"
+            bw = x2 - x1
+            if bw >= 24:
+                c.create_text((x1 + x2) / 2, (BY1 + BY2) / 2,
+                              text=f"{rw} 0x{self._pending_req['addr']:04X}",
+                              fill=CYAN, font=("Consolas", 7))
+
+        # Current-cycle tick
+        cx = LEFT + self.cycle * scale
+        if cx <= w - RIGHT:
+            c.create_line(cx, AXIS_Y, cx, AXIS_Y + TICK_H, fill=ACCENT, width=1)
+            c.create_text(cx, AXIS_Y + TICK_H + 2,
+                          text=str(self.cycle),
+                          fill=ACCENT, font=("Consolas", 7), anchor=tk.N)
 
     def _open_memory_window(self):
         """Open (or bring to front) the memory map window."""
@@ -929,10 +1084,12 @@ class SimulatorGUI:
             "cpu":               copy.deepcopy(self.cpu),
             "_mem_op_started":   self._mem_op_started,
             "cycle":             self.cycle,
-            "log_items":         list(self._log_items),   # shallow-copy; tuples are immutable
+            "log_items":         list(self._log_items),
             "mem_active_block":  self._mem_active_block,
             "mem_alloc_block":   self._mem_alloc_block,
             "mem_wb_block":      self._mem_wb_block,
+            "timeline_entries":  list(self._timeline_entries),  # shallow; dicts are replaced not mutated
+            "pending_req":       dict(self._pending_req) if self._pending_req else None,
         }
 
     def _restore_snapshot(self, snap):
@@ -946,6 +1103,8 @@ class SimulatorGUI:
         self._mem_active_block   = snap.get("mem_active_block")
         self._mem_alloc_block    = snap.get("mem_alloc_block")
         self._mem_wb_block       = snap.get("mem_wb_block")
+        self._timeline_entries   = list(snap.get("timeline_entries", []))
+        self._pending_req        = snap.get("pending_req")
 
         # Rebuild the log widget from the stored line/tag pairs
         self.log_text.configure(state=tk.NORMAL)
@@ -963,6 +1122,7 @@ class SimulatorGUI:
         self._update_stats()
         self._update_history_scrubber()
         self._update_memory_window()
+        self._update_timeline()
 
     def _step_back(self):
         """Go one cycle backward through recorded history."""
