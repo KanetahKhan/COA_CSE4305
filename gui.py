@@ -20,6 +20,7 @@ import os
 sys.path.insert(0, os.path.dirname(__file__))
 
 import math
+import copy
 from cache_controller import CacheController, State, RequestType, Policy
 from memory import Memory
 from cpu import CPU
@@ -75,6 +76,12 @@ class SimulatorGUI:
         self.request_list    = []
         self._mem_op_started = False
 
+        # Step-back / replay history
+        self._history   = []      # list of snapshots, one per cycle
+        self._log_items = []      # (line_text, tag) pairs mirroring the log widget
+        self._hist_pos  = -1      # current position in _history
+        self._scrubbing = False   # suppress re-entry in _on_scrub
+
         # Preset scenarios
         self.preset_requests = {
             "Read Miss → Hit": [
@@ -116,6 +123,10 @@ class SimulatorGUI:
         self._create_sim_objects()
         self._init_memory_data()
         self._refresh_all()
+        # Snapshot cycle-0 state so Back works from the very first step
+        self._history.append(self._take_snapshot())
+        self._hist_pos = 0
+        self._update_history_scrubber()
 
     # ------------------------------------------------------------------
     # Simulation object creation (called on every reset)
@@ -261,7 +272,14 @@ class SimulatorGUI:
         row2 = ttk.Frame(frame, style="Panel.TFrame")
         row2.pack(fill=tk.X, padx=8, pady=(4, 4))
 
-        self.step_btn = tk.Button(row2, text="⏵ Step", command=self._step,
+        self.back_btn = tk.Button(row2, text="⏮ Back", command=self._step_back,
+                                  bg="#45475a", fg=YELLOW,
+                                  font=("Consolas", 10, "bold"),
+                                  relief=tk.FLAT, padx=12, pady=4,
+                                  state=tk.DISABLED)
+        self.back_btn.pack(side=tk.LEFT, padx=(0, 4))
+
+        self.step_btn = tk.Button(row2, text="⏭ Step", command=self._step,
                                   bg="#45475a", fg=TEXT_COLOR,
                                   font=("Consolas", 10, "bold"),
                                   relief=tk.FLAT, padx=12, pady=4)
@@ -295,6 +313,26 @@ class SimulatorGUI:
                                     command=self._update_speed)
         self.speed_scale.set(500)
         self.speed_scale.pack(side=tk.LEFT, padx=4)
+
+        # History scrubber row
+        row_hist = ttk.Frame(frame, style="Panel.TFrame")
+        row_hist.pack(fill=tk.X, padx=8, pady=(0, 2))
+
+        tk.Label(row_hist, text="History:", bg=PANEL_BG, fg=DIM,
+                 font=("Consolas", 9)).pack(side=tk.LEFT)
+        self.hist_scale = tk.Scale(row_hist, from_=0, to=0,
+                                   orient=tk.HORIZONTAL,
+                                   bg=PANEL_BG, fg=TEXT_COLOR,
+                                   troughcolor="#45475a",
+                                   highlightthickness=0,
+                                   font=("Consolas", 8), length=200,
+                                   showvalue=False,
+                                   command=self._on_scrub)
+        self.hist_scale.pack(side=tk.LEFT, padx=4)
+        self.hist_pos_lbl = tk.Label(row_hist, text="cycle 0 / 0",
+                                     bg=PANEL_BG, fg=DIM,
+                                     font=("Consolas", 9))
+        self.hist_pos_lbl.pack(side=tk.LEFT, padx=4)
 
         # Row 3 — associativity + policy selectors
         row3 = ttk.Frame(frame, style="Panel.TFrame")
@@ -671,8 +709,10 @@ class SimulatorGUI:
     # ------------------------------------------------------------------
 
     def _log(self, message, tag="dim"):
+        line = f"[{self.cycle:>4}] {message}\n"
+        self._log_items.append((line, tag))
         self.log_text.configure(state=tk.NORMAL)
-        self.log_text.insert(tk.END, f"[{self.cycle:>4}] {message}\n", tag)
+        self.log_text.insert(tk.END, line, tag)
         self.log_text.see(tk.END)
         self.log_text.configure(state=tk.DISABLED)
 
@@ -681,6 +721,14 @@ class SimulatorGUI:
     # ------------------------------------------------------------------
 
     def _step(self):
+        # ── replay mode: restore the next already-recorded snapshot ──────────
+        if self._hist_pos < len(self._history) - 1:
+            self._hist_pos += 1
+            self._restore_snapshot(self._history[self._hist_pos])
+            self._refresh_after_restore()
+            return
+
+        # ── normal forward execution ──────────────────────────────────────────
         if self.cpu.is_done() and self.cache_ctrl.state == State.IDLE:
             if not self.request_list:
                 self._log("Simulation complete — no more requests.", "done")
@@ -707,8 +755,8 @@ class SimulatorGUI:
                 self.cache_ctrl.mem.data_in = list(self.memory.buffer)
             self._mem_op_started = False
 
-        prev_state      = self.cache_ctrl.state
-        log_len_before  = len(self.cache_ctrl.log)
+        prev_state     = self.cache_ctrl.state
+        log_len_before = len(self.cache_ctrl.log)
         self.cache_ctrl.tick()
         curr_state = self.cache_ctrl.state
 
@@ -725,7 +773,6 @@ class SimulatorGUI:
             self.memory.start_read(self.cache_ctrl.mem.address)
             self._mem_op_started = True
 
-        # Append new log entries to the event log widget
         for entry in self.cache_ctrl.log[log_len_before:]:
             event   = entry["event"]
             details = entry["details"]
@@ -758,6 +805,11 @@ class SimulatorGUI:
             self._log("All requests completed!", "done")
             if self.running:
                 self._toggle_run()
+
+        # ── record this cycle's snapshot ──────────────────────────────────────
+        self._history.append(self._take_snapshot())
+        self._hist_pos = len(self._history) - 1
+        self._update_history_scrubber()
 
     # ------------------------------------------------------------------
     # Run / pause / reset / speed
@@ -792,12 +844,22 @@ class SimulatorGUI:
         if self.request_list:
             self.cpu.load_requests(list(self.request_list))
 
+        # Wipe history and log
+        self._history   = []
+        self._log_items = []
+        self._hist_pos  = -1
+
         self.log_text.configure(state=tk.NORMAL)
         self.log_text.delete("1.0", tk.END)
         self.log_text.configure(state=tk.DISABLED)
 
         self._refresh_all()
         self._log("Simulator reset. Ready.", "info")
+
+        # Snapshot cycle-0 so the user can step back to the very start
+        self._history.append(self._take_snapshot())
+        self._hist_pos = 0
+        self._update_history_scrubber()
 
     # ------------------------------------------------------------------
     # Associativity / policy combo handlers
@@ -806,6 +868,76 @@ class SimulatorGUI:
     def _open_compare(self):
         """Open the side-by-side policy comparison window."""
         CompareWindow(self.root, initial_requests=list(self.request_list))
+
+    # ------------------------------------------------------------------
+    # Step-back / replay history
+    # ------------------------------------------------------------------
+
+    def _take_snapshot(self):
+        """Deep-copy all simulation state into a dict for later restore."""
+        return {
+            "cache_ctrl":      copy.deepcopy(self.cache_ctrl),
+            "memory":          copy.deepcopy(self.memory),
+            "cpu":             copy.deepcopy(self.cpu),
+            "_mem_op_started": self._mem_op_started,
+            "cycle":           self.cycle,
+            "log_items":       list(self._log_items),   # shallow-copy; tuples are immutable
+        }
+
+    def _restore_snapshot(self, snap):
+        """Replace live simulation objects with the copies stored in snap."""
+        self.cache_ctrl      = snap["cache_ctrl"]
+        self.memory          = snap["memory"]
+        self.cpu             = snap["cpu"]
+        self._mem_op_started = snap["_mem_op_started"]
+        self.cycle           = snap["cycle"]
+        self._log_items      = list(snap["log_items"])
+
+        # Rebuild the log widget from the stored line/tag pairs
+        self.log_text.configure(state=tk.NORMAL)
+        self.log_text.delete("1.0", tk.END)
+        for line, tag in self._log_items:
+            self.log_text.insert(tk.END, line, tag)
+        self.log_text.see(tk.END)
+        self.log_text.configure(state=tk.DISABLED)
+
+    def _refresh_after_restore(self):
+        """Redraw all panels after a snapshot restore (back or scrub)."""
+        self._draw_fsm()
+        self._update_cache_table()
+        self._update_signals()
+        self._update_stats()
+        self._update_history_scrubber()
+
+    def _step_back(self):
+        """Go one cycle backward through recorded history."""
+        if self._hist_pos <= 0:
+            return
+        self._hist_pos -= 1
+        self._restore_snapshot(self._history[self._hist_pos])
+        self._refresh_after_restore()
+
+    def _update_history_scrubber(self):
+        """Sync the scrubber range, thumb position, label, and Back button."""
+        max_pos = max(0, len(self._history) - 1)
+        self._scrubbing = True          # suppress _on_scrub re-entry
+        self.hist_scale.configure(to=max_pos)
+        self.hist_scale.set(self._hist_pos)
+        self._scrubbing = False
+        self.hist_pos_lbl.configure(text=f"cycle {self._hist_pos} / {max_pos}")
+        self.back_btn.configure(
+            state=tk.NORMAL if self._hist_pos > 0 else tk.DISABLED)
+
+    def _on_scrub(self, val):
+        """Called when the user drags the history scrubber."""
+        if self._scrubbing:
+            return
+        pos = int(float(val))
+        if pos == self._hist_pos or not (0 <= pos < len(self._history)):
+            return
+        self._hist_pos = pos
+        self._restore_snapshot(self._history[pos])
+        self._refresh_after_restore()
 
     def _on_assoc_change(self, _event=None):
         assoc = self._current_associativity()
