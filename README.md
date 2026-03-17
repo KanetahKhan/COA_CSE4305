@@ -1,0 +1,155 @@
+# Cache Controller FSM Simulator
+
+A cycle-accurate simulator for a **Finite State Machine (FSM) based cache controller**, built in Python. Demonstrates how a simple CPU, cache controller, and main memory interact through interfacing signals across clock cycles.
+
+## Architecture Overview
+
+```
+┌─────────┐     CPU Interface      ┌──────────────────┐     Memory Interface     ┌──────────┐
+│         │  valid, rd/wr, addr,   │                  │   rd/wr, addr, data,    │          │
+│   CPU   │  data_in, data_out,    │  Cache Controller │   ready                 │  Memory  │
+│ (queue) │  ready, stall          │      (FSM)        │                         │ (latency)│
+│         │ ◄────────────────────► │                  │ ◄─────────────────────► │          │
+└─────────┘                        └──────────────────┘                         └──────────┘
+```
+
+### Components
+
+| Component | Description |
+|-----------|-------------|
+| **CPU** | Issues read/write requests from a pre-loaded queue. Stalls while waiting for cache response. |
+| **Cache Controller** | 4-state FSM managing a direct-mapped, write-back, write-allocate cache. |
+| **Memory** | Simple main memory that never misses, but has configurable multi-cycle read/write latency. |
+
+### FSM States
+
+```
+        ┌──────────┐
+        │   IDLE   │ ◄─────────────────────────────────┐
+        └────┬─────┘                                    │
+             │ CPU request valid                        │ CPU ready
+             ▼                                          │
+     ┌───────────────┐                                  │
+     │  COMPARE_TAG  │──── Hit ─────────────────────────┘
+     └───────┬───────┘
+             │ Miss
+             ├─── Clean/Invalid ──────┐
+             │                        ▼
+             │                  ┌───────────┐
+             │                  │  ALLOCATE  │──── mem ready ───► IDLE
+             │                  └───────────┘
+             │
+             └─── Dirty ─────► ┌────────────┐
+                               │ WRITE_BACK │──── mem ready ───► ALLOCATE
+                               └────────────┘
+```
+
+| State | Description |
+|-------|-------------|
+| **IDLE** | Waits for a valid CPU request. |
+| **COMPARE_TAG** | Decomposes address into tag/index/offset, checks for hit or miss. |
+| **WRITE_BACK** | Writes a dirty evicted block back to memory (multi-cycle). |
+| **ALLOCATE** | Fetches the requested block from memory into cache (multi-cycle). |
+
+### Interfacing Signals
+
+**CPU ↔ Cache Controller:**
+- `valid` — CPU has a pending request
+- `read_write` — Request type (READ or WRITE)
+- `address` — Target memory address
+- `data_in` / `data_out` — Data bus
+- `ready` — Controller signals request completion
+- `stall` — Controller stalls the CPU
+
+**Cache Controller ↔ Memory:**
+- `read` / `write` — Memory operation request
+- `address` — Block-aligned memory address
+- `data_in` / `data_out` — Block data bus
+- `ready` — Memory signals operation completion
+
+## Cache Configuration
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| Cache Lines | 8 | Number of cache lines (direct-mapped) |
+| Block Size | 4 words | Words per cache block |
+| Address Bits | 16 | Address space width |
+| Memory Read Latency | 3 cycles | Cycles to read a block from memory |
+| Memory Write Latency | 2 cycles | Cycles to write a block to memory |
+| Write Policy | Write-Back | Dirty blocks written to memory on eviction |
+| Write-Miss Policy | Write-Allocate | On write miss, fetch block then write |
+
+## How to Build, Run, and Test
+
+### Prerequisites
+
+- **Python 3.8+** (no external dependencies)
+
+### Running
+
+```bash
+# GUI mode (recommended)
+python gui.py
+
+# Terminal mode — all 6 test scenarios
+python main.py
+
+# Run a specific test
+python main.py --test 1    # Read miss → read hit
+python main.py --test 2    # Write miss → read hit
+python main.py --test 3    # Dirty eviction (write-back)
+python main.py --test 4    # Clean eviction
+python main.py --test 5    # Sequential writes + readback
+python main.py --test 6    # Stress test (4-line cache)
+```
+
+### GUI Features
+
+- **FSM State Diagram** — live-updating with highlighted transitions
+- **Cache Table** — shows valid/dirty/tag/data for every line
+- **Interface Signals** — CPU and Memory signals update each cycle
+- **Step / Run / Reset** — step one cycle at a time or auto-run with speed control
+- **Presets** — load predefined test scenarios from dropdown
+- **Custom Requests** — add your own READ/WRITE requests
+- **Event Log** — color-coded cycle-by-cycle event trace
+
+### Test Scenarios
+
+| # | Scenario | What It Covers |
+|---|----------|---------------|
+| 1 | Read miss → Read hit | Cold miss, ALLOCATE state, subsequent hit from COMPARE_TAG |
+| 2 | Write miss → Read hit | Write-allocate policy, dirty bit set, read-back verification |
+| 3 | Dirty eviction | Conflict miss triggers WRITE_BACK → ALLOCATE → IDLE |
+| 4 | Clean eviction | Conflict miss on clean block skips WRITE_BACK |
+| 5 | Sequential writes + reads | Multiple blocks, all hits on readback |
+| 6 | Stress test | 4-line cache with heavy eviction and write-backs |
+
+### Output Format
+
+Each cycle shows:
+1. **State transition** (e.g., `IDLE → COMPARE_TAG`)
+2. **Event type** (e.g., `CACHE_HIT_READ`, `CACHE_MISS_DIRTY`)
+3. **Details** (address decomposition, data values)
+4. **Active signals** (`CPU_RDY`, `STALL`, `MEM_RD`, `MEM_WR`)
+
+After simulation: final cache contents, hit/miss statistics, and CPU result log.
+
+## Project Structure
+
+```
+cache-fsm-sim/
+├── gui.py               # GUI simulator (Tkinter)
+├── main.py              # Terminal entry point with test scenarios
+├── simulator.py         # Simulation engine (connects all components)
+├── cache_controller.py  # FSM cache controller + cache data structures
+├── memory.py            # Simple memory with configurable latency
+├── cpu.py               # CPU that issues requests from a queue
+├── README.md
+└── tests/
+    └── test_verify.py   # Automated correctness tests
+```
+
+## Authors
+
+CSE 4305 — Computer Organization & Architecture  
+Islamic University of Technology (IUT)
