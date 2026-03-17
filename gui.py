@@ -23,6 +23,7 @@ import math
 from cache_controller import CacheController, State, RequestType, Policy
 from memory import Memory
 from cpu import CPU
+from compare_window import CompareWindow
 
 
 STATE_COLORS = {
@@ -41,6 +42,7 @@ RED       = "#f38ba8"
 YELLOW    = "#f9e2af"
 CYAN      = "#89dceb"
 DIM       = "#6c7086"
+PURPLE    = "#cba6f7"
 
 ASSOC_OPTIONS  = ["1 (Direct)", "2-way", "4-way", "8-way (Fully Assoc.)"]
 POLICY_OPTIONS = ["LRU", "LFU", "Random"]
@@ -275,7 +277,12 @@ class SimulatorGUI:
                                    bg="#45475a", fg=RED,
                                    font=("Consolas", 10, "bold"),
                                    relief=tk.FLAT, padx=12, pady=4)
-        self.reset_btn.pack(side=tk.LEFT, padx=(0, 12))
+        self.reset_btn.pack(side=tk.LEFT, padx=(0, 4))
+
+        tk.Button(row2, text="⇌ Compare", command=self._open_compare,
+                  bg="#45475a", fg=PURPLE,
+                  font=("Consolas", 10, "bold"),
+                  relief=tk.FLAT, padx=12, pady=4).pack(side=tk.LEFT, padx=(0, 12))
 
         tk.Label(row2, text="Speed:", bg=PANEL_BG, fg=DIM,
                  font=("Consolas", 9)).pack(side=tk.LEFT)
@@ -795,6 +802,10 @@ class SimulatorGUI:
     # ------------------------------------------------------------------
     # Associativity / policy combo handlers
     # ------------------------------------------------------------------
+
+    def _open_compare(self):
+        """Open the side-by-side policy comparison window."""
+        CompareWindow(self.root, initial_requests=list(self.request_list))
 
     def _on_assoc_change(self, _event=None):
         assoc = self._current_associativity()
