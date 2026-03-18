@@ -73,6 +73,13 @@ class SimulatorGUI:
         self.root.geometry("1300x860")
         self.root.minsize(1100, 780)
 
+        # Configurable cache/memory parameters (edited via Settings dialog)
+        self._cfg_num_lines  = 8
+        self._cfg_block_size = 4
+        self._cfg_addr_bits  = 16
+        self._cfg_read_lat   = 3
+        self._cfg_write_lat  = 2
+
         # Simulation state
         self.cycle           = 0
         self.running         = False
@@ -164,19 +171,29 @@ class SimulatorGUI:
         policy = self._current_policy()
 
         self.cache_ctrl      = CacheController(
-            num_lines=8, block_size=4, addr_bits=16,
+            num_lines=self._cfg_num_lines,
+            block_size=self._cfg_block_size,
+            addr_bits=self._cfg_addr_bits,
             associativity=assoc, policy=policy,
         )
-        self.memory          = Memory(size=65536, block_size=4,
-                                      read_latency=3, write_latency=2)
+        self.memory          = Memory(
+            size=2 ** self._cfg_addr_bits,
+            block_size=self._cfg_block_size,
+            read_latency=self._cfg_read_lat,
+            write_latency=self._cfg_write_lat,
+        )
         self.cpu             = CPU()
         self._mem_op_started = False
         self.cycle           = 0
 
     def _init_memory_data(self):
-        self.memory.init_region(0x0000, [0x11, 0x22, 0x33, 0x44])
-        self.memory.init_region(0x0100, [0xAA, 0xBB, 0xCC, 0xDD])
-        self.memory.init_region(0x0200, [0x10, 0x20, 0x30, 0x40])
+        bs = self._cfg_block_size
+        # Generate recognisable patterns that scale with block size
+        def _pat(base, step):
+            return [((base + i * step) & 0xFF) for i in range(bs)]
+        self.memory.init_region(0x0000, _pat(0x11, 0x11))
+        self.memory.init_region(0x0100, _pat(0xAA, 0x11))
+        self.memory.init_region(0x0200, _pat(0x10, 0x10))
 
     # ------------------------------------------------------------------
     # UI construction
@@ -388,6 +405,12 @@ class SimulatorGUI:
                                          width=10)
         self.policy_combo.pack(side=tk.LEFT, padx=(2, 0))
 
+        tk.Button(row3, text="⚙ Settings", command=self._open_settings,
+                  bg="#45475a", fg=ACCENT,
+                  font=("Consolas", 9, "bold"),
+                  relief=tk.FLAT, padx=10, pady=2).pack(side=tk.LEFT, padx=(12, 0))
+
+
         # Row 4 — preset selector
         row4 = ttk.Frame(frame, style="Panel.TFrame")
         row4.pack(fill=tk.X, padx=8, pady=(0, 8))
@@ -416,12 +439,16 @@ class SimulatorGUI:
 
     def _config_str(self):
         assoc = self._current_associativity()
+        nl    = self._cfg_num_lines
+        bs    = self._cfg_block_size
+        ab    = self._cfg_addr_bits
         if assoc == 1:
-            return "Config: Direct-Mapped  |  8 lines  |  block=4  |  16-bit addr"
-        pol   = self.policy_var.get()
-        sets  = 8 // assoc
-        return (f"Config: {assoc}-way Set-Assoc  |  {sets} sets × {assoc} ways  |"
-                f"  Policy: {pol}  |  block=4  |  16-bit addr")
+            return (f"Config: Direct-Mapped  |  {nl} lines  |  "
+                    f"block={bs}  |  {ab}-bit addr")
+        pol  = self.policy_var.get()
+        sets = nl // assoc
+        return (f"Config: {assoc}-way Set-Assoc  |  {sets} sets × {assoc} ways  |  "
+                f"Policy: {pol}  |  block={bs}  |  {ab}-bit addr")
 
     def _build_cache_panel(self, parent):
         frame = ttk.Frame(parent, style="Panel.TFrame")
@@ -1533,6 +1560,220 @@ class SimulatorGUI:
             self._mem_alloc_block,
             self._mem_wb_block,
         )
+
+    # ------------------------------------------------------------------
+    # Settings dialog
+    # ------------------------------------------------------------------
+
+    def _open_settings(self):
+        """Modal dialog for configuring cache and memory parameters."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Cache Parameters")
+        dlg.configure(bg=BG_COLOR)
+        dlg.resizable(False, False)
+        dlg.grab_set()          # modal
+        dlg.transient(self.root)
+
+        # ── valid option lists ─────────────────────────────────────────
+        LINE_OPTS  = [2, 4, 8, 16, 32, 64, 128, 256]
+        BLOCK_OPTS = [2, 4, 8, 16, 32]
+        ADDR_OPTS  = [8, 10, 12, 14, 16, 18, 20, 24]
+        LAT_RANGE  = (1, 50)
+
+        # ── local vars (pre-populate from current config) ──────────────
+        v_lines  = tk.IntVar(value=self._cfg_num_lines)
+        v_block  = tk.IntVar(value=self._cfg_block_size)
+        v_addr   = tk.IntVar(value=self._cfg_addr_bits)
+        v_rdlat  = tk.IntVar(value=self._cfg_read_lat)
+        v_wrlat  = tk.IntVar(value=self._cfg_write_lat)
+
+        def lbl(parent, text, fg=DIM):
+            return tk.Label(parent, text=text, bg=PANEL_BG, fg=fg,
+                            font=("Consolas", 9))
+
+        def combo(parent, var, opts, width=8):
+            cb = ttk.Combobox(parent, textvariable=var,
+                              values=opts, state="readonly", width=width)
+            cb.bind("<<ComboboxSelected>>", lambda _e: refresh_preview())
+            return cb
+
+        def spinbox(parent, var):
+            sb = tk.Spinbox(parent, textvariable=var,
+                            from_=LAT_RANGE[0], to=LAT_RANGE[1],
+                            width=5, bg="#45475a", fg=TEXT_COLOR,
+                            font=("Consolas", 9), buttonbackground="#45475a",
+                            command=refresh_preview)
+            sb.bind("<KeyRelease>", lambda _e: refresh_preview())
+            return sb
+
+        # ── layout ─────────────────────────────────────────────────────
+        pad = dict(padx=12, pady=4)
+
+        outer = tk.Frame(dlg, bg=BG_COLOR, padx=16, pady=12)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        # Title
+        tk.Label(outer, text="Cache Parameters", bg=BG_COLOR, fg=ACCENT,
+                 font=("Consolas", 12, "bold")).grid(
+                     row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 8))
+
+        # Section: Cache structure
+        sect = tk.Frame(outer, bg=PANEL_BG, padx=10, pady=8)
+        sect.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+
+        tk.Label(sect, text="Cache Structure", bg=PANEL_BG, fg=ACCENT,
+                 font=("Consolas", 10, "bold")).grid(
+                     row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 6))
+
+        lbl(sect, "Number of lines").grid(row=1, column=0, sticky=tk.W, **pad)
+        combo(sect, v_lines, LINE_OPTS, width=6).grid(row=1, column=1, sticky=tk.W)
+        lbl(sect, "(power of 2)").grid(row=1, column=2, sticky=tk.W, padx=(4, 0))
+
+        lbl(sect, "Block size (words)").grid(row=2, column=0, sticky=tk.W, **pad)
+        combo(sect, v_block, BLOCK_OPTS, width=6).grid(row=2, column=1, sticky=tk.W)
+        lbl(sect, "(power of 2)").grid(row=2, column=2, sticky=tk.W, padx=(4, 0))
+
+        lbl(sect, "Address bits").grid(row=3, column=0, sticky=tk.W, **pad)
+        combo(sect, v_addr, ADDR_OPTS, width=6).grid(row=3, column=1, sticky=tk.W)
+        lbl(sect, f"(addr space = 2ⁿ bytes)").grid(
+            row=3, column=2, sticky=tk.W, padx=(4, 0))
+
+        # Section: Memory latency
+        lsect = tk.Frame(outer, bg=PANEL_BG, padx=10, pady=8)
+        lsect.grid(row=2, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+
+        tk.Label(lsect, text="Memory Latency", bg=PANEL_BG, fg=ACCENT,
+                 font=("Consolas", 10, "bold")).grid(
+                     row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 6))
+
+        lbl(lsect, "Read latency (cycles)").grid(row=1, column=0, sticky=tk.W, **pad)
+        spinbox(lsect, v_rdlat).grid(row=1, column=1, sticky=tk.W)
+
+        lbl(lsect, "Write latency (cycles)").grid(row=2, column=0, sticky=tk.W, **pad)
+        spinbox(lsect, v_wrlat).grid(row=2, column=1, sticky=tk.W)
+
+        # Section: Live bit-field preview
+        prev_frame = tk.Frame(outer, bg=PANEL_BG, padx=10, pady=8)
+        prev_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+
+        tk.Label(prev_frame, text="Address Bit-Field Preview", bg=PANEL_BG, fg=ACCENT,
+                 font=("Consolas", 10, "bold")).pack(anchor=tk.W, pady=(0, 4))
+
+        preview_lbl = tk.Label(prev_frame, text="", bg=PANEL_BG, fg=TEXT_COLOR,
+                               font=("Consolas", 9), justify=tk.LEFT, anchor=tk.W)
+        preview_lbl.pack(fill=tk.X)
+
+        warn_lbl = tk.Label(prev_frame, text="", bg=PANEL_BG, fg=RED,
+                            font=("Consolas", 9, "bold"), anchor=tk.W)
+        warn_lbl.pack(fill=tk.X)
+
+        def refresh_preview(_e=None):
+            try:
+                nl  = int(v_lines.get())
+                bs  = int(v_block.get())
+                ab  = int(v_addr.get())
+                assoc = self._current_associativity()
+                ns  = max(nl // assoc, 1)
+
+                ob = (bs - 1).bit_length()
+                ib = (ns - 1).bit_length() if ns > 1 else 0
+                tb = ab - ob - ib
+
+                addr_space = 2 ** ab
+                unit = "KB" if addr_space >= 1024 else "B"
+                space_val = addr_space // 1024 if addr_space >= 1024 else addr_space
+
+                lines = [
+                    f"  Address bits   : {ab}",
+                    f"  Addr space     : {space_val} {unit}",
+                    f"  Tag bits       : {tb}  [bits {ab-1}:{ob+ib}]",
+                    f"  Index bits     : {ib}  [bits {ob+ib-1}:{ob}]" if ib > 0
+                    else "  Index bits     : 0  (fully assoc or 1 set)",
+                    f"  Offset bits    : {ob}  [bits {ob-1}:0]",
+                    f"  Cache size     : {nl * bs} words  ({nl} lines × {bs} words)",
+                ]
+                preview_lbl.configure(text="\n".join(lines))
+
+                errors = []
+                if tb < 1:
+                    errors.append("⚠ Too many index/offset bits — tag would be < 1 bit.")
+                if nl < assoc:
+                    errors.append(f"⚠ Lines ({nl}) < current associativity ({assoc}).")
+                warn_lbl.configure(text="\n".join(errors))
+                apply_btn.configure(state=tk.NORMAL if not errors else tk.DISABLED)
+            except Exception:
+                pass
+
+        refresh_preview()
+
+        # ── buttons ────────────────────────────────────────────────────
+        btn_row = tk.Frame(outer, bg=BG_COLOR)
+        btn_row.grid(row=4, column=0, columnspan=3, pady=(6, 0), sticky="e")
+
+        tk.Label(btn_row,
+                 text="⚠ Applying will reset the simulation.",
+                 bg=BG_COLOR, fg=YELLOW,
+                 font=("Consolas", 8)).pack(side=tk.LEFT, padx=(0, 16))
+
+        tk.Button(btn_row, text="Cancel",
+                  command=dlg.destroy,
+                  bg="#45475a", fg=DIM,
+                  font=("Consolas", 9, "bold"),
+                  relief=tk.FLAT, padx=10, pady=4).pack(side=tk.LEFT, padx=(0, 6))
+
+        apply_btn = tk.Button(btn_row, text="Apply & Reset",
+                              command=lambda: self._apply_settings(
+                                  dlg,
+                                  int(v_lines.get()), int(v_block.get()),
+                                  int(v_addr.get()),  int(v_rdlat.get()),
+                                  int(v_wrlat.get()),
+                              ),
+                              bg="#45475a", fg=GREEN,
+                              font=("Consolas", 9, "bold"),
+                              relief=tk.FLAT, padx=10, pady=4)
+        apply_btn.pack(side=tk.LEFT)
+
+        # Centre dialog over main window
+        dlg.update_idletasks()
+        mx = self.root.winfo_x() + (self.root.winfo_width()  - dlg.winfo_width())  // 2
+        my = self.root.winfo_y() + (self.root.winfo_height() - dlg.winfo_height()) // 2
+        dlg.geometry(f"+{mx}+{my}")
+
+    def _apply_settings(self, dlg, num_lines, block_size, addr_bits,
+                        read_lat, write_lat):
+        """Validate, store config, close dialog, reset simulation."""
+        assoc = self._current_associativity()
+
+        # Hard validation (Apply button should already be disabled on error,
+        # but guard here too)
+        ob = (block_size - 1).bit_length()
+        ns = max(num_lines // assoc, 1)
+        ib = (ns - 1).bit_length() if ns > 1 else 0
+        tb = addr_bits - ob - ib
+
+        if tb < 1:
+            messagebox.showerror(
+                "Invalid Configuration",
+                "Tag bits < 1.\nReduce block size or increase address bits.",
+                parent=dlg)
+            return
+        if num_lines < assoc:
+            messagebox.showerror(
+                "Invalid Configuration",
+                f"Number of lines ({num_lines}) is less than current "
+                f"associativity ({assoc}).\n"
+                "Reduce associativity first (in the main window).",
+                parent=dlg)
+            return
+
+        self._cfg_num_lines  = num_lines
+        self._cfg_block_size = block_size
+        self._cfg_addr_bits  = addr_bits
+        self._cfg_read_lat   = read_lat
+        self._cfg_write_lat  = write_lat
+
+        dlg.destroy()
+        self._reset()
 
     def _open_compare(self):
         """Open the side-by-side policy comparison window."""
