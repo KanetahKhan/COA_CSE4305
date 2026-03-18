@@ -31,6 +31,7 @@ class CacheLine:
     data: list = field(default_factory=lambda: [0] * 4)
     lru_counter: int = 0   # timestamp of last access (higher = more recent)
     access_count: int = 0  # total accesses, used by LFU
+    write_count: int = 0   # dirty writes to this line (reset on eviction)
 
 
 @dataclass
@@ -253,6 +254,7 @@ class CacheController:
             else:
                 line.data[offset] = self.saved_data
                 line.dirty = True
+                line.write_count += 1
                 self._log_event(
                     "CACHE_HIT_WRITE",
                     f"tag=0x{tag:X} set={set_idx} way={hit_way} offset={offset} "
@@ -336,6 +338,7 @@ class CacheController:
             line.data         = list(self.mem.data_in)
             line.dirty        = False
             line.access_count = 0          # reset before _touch increments it
+            line.write_count  = 0          # fresh occupant — reset dirty-write counter
             self._touch(set_idx, way)      # stamp LRU + access_count = 1
 
             if self.saved_request == RequestType.READ:
@@ -350,6 +353,7 @@ class CacheController:
             else:
                 line.data[offset] = self.saved_data
                 line.dirty        = True
+                line.write_count += 1
                 self._log_event(
                     "ALLOCATE_DONE_WRITE",
                     f"Fetched block from mem addr=0x{block_addr:04X} "
@@ -387,8 +391,9 @@ class CacheController:
                     "dirty": line.dirty,
                     "tag":   f"0x{line.tag:X}",
                     "data":  [f"0x{d:02X}" for d in line.data],
-                    "lru":   line.lru_counter,
-                    "freq":  line.access_count,
+                    "lru":        line.lru_counter,
+                    "freq":       line.access_count,
+                    "write_count": line.write_count,
                 })
         return snapshot
 

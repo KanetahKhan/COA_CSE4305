@@ -457,8 +457,8 @@ class SimulatorGUI:
         ttk.Label(frame, text=" Cache Contents",
                   style="Title.TLabel").pack(anchor=tk.W, padx=8, pady=(8, 4))
 
-        # Always use 6 columns; "Way" shows "—" in direct-mapped mode
-        cols = ("Set", "Way", "V", "D", "Tag", "Block Data")
+        # 7 columns: added "Wr" (write count) for the heatmap
+        cols = ("Set", "Way", "V", "D", "Tag", "Wr", "Block Data")
         self.cache_tree = ttk.Treeview(frame, columns=cols,
                                        show="headings", height=8)
 
@@ -470,19 +470,37 @@ class SimulatorGUI:
         style.configure("Treeview.Heading",
                         background="#45475a", foreground=TEXT_COLOR,
                         font=("Consolas", 10, "bold"))
-        style.map("Treeview", background=[("selected", "#45475a")])
+        # Clear selected-state overrides so per-row tag backgrounds show through
+        style.map("Treeview",
+                  background=[("selected", "#45475a")],
+                  foreground=[("selected", TEXT_COLOR)])
 
-        col_widths = [50, 50, 30, 30, 70, 260]
+        col_widths = [45, 45, 26, 26, 66, 32, 220]
         for col, w in zip(cols, col_widths):
             self.cache_tree.heading(col, text=col)
             self.cache_tree.column(col, width=w, anchor=tk.CENTER)
 
-        # Tag colours for dirty / valid rows
-        self.cache_tree.tag_configure("dirty",   foreground=RED)
-        self.cache_tree.tag_configure("valid",   foreground=TEXT_COLOR)
-        self.cache_tree.tag_configure("invalid", foreground=DIM)
+        self.cache_tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 4))
 
-        self.cache_tree.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        # ── heatmap legend ────────────────────────────────────────────
+        legend_row = ttk.Frame(frame, style="Panel.TFrame")
+        legend_row.pack(fill=tk.X, padx=8, pady=(0, 6))
+
+        tk.Label(legend_row, text="Writes:", bg=PANEL_BG, fg=DIM,
+                 font=("Consolas", 8)).pack(side=tk.LEFT)
+        tk.Label(legend_row, text=" 0 (cold) ", bg=PANEL_BG, fg=DIM,
+                 font=("Consolas", 8)).pack(side=tk.LEFT, padx=(2, 0))
+
+        self.heat_legend_canvas = tk.Canvas(legend_row, height=14, width=120,
+                                            bg=PANEL_BG, highlightthickness=0)
+        self.heat_legend_canvas.pack(side=tk.LEFT, padx=2)
+        self._draw_heat_legend()
+
+        tk.Label(legend_row, text=" (hot) max", bg=PANEL_BG, fg=DIM,
+                 font=("Consolas", 8)).pack(side=tk.LEFT)
+        self.heat_max_label = tk.Label(legend_row, text="", bg=PANEL_BG, fg=DIM,
+                                       font=("Consolas", 8))
+        self.heat_max_label.pack(side=tk.LEFT, padx=(4, 0))
 
     def _build_request_panel(self, parent):
         frame = ttk.Frame(parent, style="Panel.TFrame")
@@ -687,30 +705,70 @@ class SimulatorGUI:
     # Cache table update
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _heat_color(count, max_count):
+        """Interpolate a row background from dark-blue (cold) to dark-red (hot)."""
+        if max_count == 0 or count == 0:
+            return "#1a1a2e"          # same as table bg — effectively invisible
+        t = min(count / max_count, 1.0)
+        # cold: (22, 30, 74)  →  hot: (80, 20, 22)
+        r = int(22  + t * (80  - 22))
+        g = int(30  + t * (20  - 30))
+        b = int(74  + t * (22  - 74))
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _draw_heat_legend(self):
+        """Render the cold→hot gradient strip in the legend canvas."""
+        c = self.heat_legend_canvas
+        c.delete("all")
+        w = 120
+        steps = 20
+        for i in range(steps):
+            t   = i / (steps - 1)
+            r   = int(22  + t * (80  - 22))
+            g   = int(30  + t * (20  - 30))
+            b   = int(74  + t * (22  - 74))
+            col = f"#{r:02x}{g:02x}{b:02x}"
+            x1  = int(i * w / steps)
+            x2  = int((i + 1) * w / steps)
+            c.create_rectangle(x1, 0, x2, 14, fill=col, outline="")
+
     def _update_cache_table(self):
         for item in self.cache_tree.get_children():
             self.cache_tree.delete(item)
 
-        ctrl  = self.cache_ctrl
-        assoc = ctrl.associativity
+        ctrl      = self.cache_ctrl
+        assoc     = ctrl.associativity
+        snapshot  = ctrl.get_cache_snapshot()
 
-        for line in ctrl.get_cache_snapshot():
+        max_wc = max((ln["write_count"] for ln in snapshot), default=0)
+        self.heat_max_label.configure(
+            text=f"= {max_wc}" if max_wc > 0 else "")
+
+        for line in snapshot:
             v    = "1" if line["valid"] else "0"
             d    = "1" if line["dirty"] else "0"
-            tag  = "—"  if not line["valid"] else line["tag"]
+            tag  = "—" if not line["valid"] else line["tag"]
             data = " ".join(line["data"])
             way  = str(line["way"]) if assoc > 1 else "—"
+            wc   = str(line["write_count"]) if line["write_count"] > 0 else "—"
+
+            bg = self._heat_color(line["write_count"], max_wc)
 
             if line["valid"] and line["dirty"]:
-                row_tag = "dirty"
+                fg = RED
             elif line["valid"]:
-                row_tag = "valid"
+                fg = TEXT_COLOR
             else:
-                row_tag = "invalid"
+                fg = DIM
+
+            # One composite tag per line slot — encodes both bg and fg
+            tag_name = f"heat_{line['set']}_{line['way']}"
+            self.cache_tree.tag_configure(tag_name, background=bg, foreground=fg)
 
             self.cache_tree.insert("", tk.END,
-                                   values=(line["set"], way, v, d, tag, data),
-                                   tags=(row_tag,))
+                                   values=(line["set"], way, v, d, tag, wc, data),
+                                   tags=(tag_name,))
 
     # ------------------------------------------------------------------
     # Signals panel update
@@ -1413,23 +1471,25 @@ class SimulatorGUI:
         out.write(section("FINAL CACHE STATE"))
         snap = ctrl.get_cache_snapshot()
         if ctrl.associativity > 1:
-            out.write(f"  {'Set':>4}  {'Way':>4}  {'V':>1}  {'D':>1}  {'Tag':<8}  {'Block Data'}\n")
-            out.write("  " + "─" * 50 + "\n")
+            out.write(f"  {'Set':>4}  {'Way':>4}  {'V':>1}  {'D':>1}  {'Tag':<8}  {'Wr':>4}  {'Block Data'}\n")
+            out.write("  " + "─" * 56 + "\n")
             for line in snap:
                 v    = "1" if line["valid"] else "0"
                 d    = "1" if line["dirty"] else "0"
                 tag  = line["tag"] if line["valid"] else "—"
                 data = " ".join(line["data"]) if line["valid"] else "(empty)"
-                out.write(f"  {line['set']:>4}  {line['way']:>4}  {v}  {d}  {tag:<8}  {data}\n")
+                wc   = str(line["write_count"]) if line["write_count"] > 0 else "—"
+                out.write(f"  {line['set']:>4}  {line['way']:>4}  {v}  {d}  {tag:<8}  {wc:>4}  {data}\n")
         else:
-            out.write(f"  {'Set':>4}  {'V':>1}  {'D':>1}  {'Tag':<8}  {'Block Data'}\n")
-            out.write("  " + "─" * 46 + "\n")
+            out.write(f"  {'Set':>4}  {'V':>1}  {'D':>1}  {'Tag':<8}  {'Wr':>4}  {'Block Data'}\n")
+            out.write("  " + "─" * 52 + "\n")
             for line in snap:
                 v    = "1" if line["valid"] else "0"
                 d    = "1" if line["dirty"] else "0"
                 tag  = line["tag"] if line["valid"] else "—"
                 data = " ".join(line["data"]) if line["valid"] else "(empty)"
-                out.write(f"  {line['set']:>4}  {v}  {d}  {tag:<8}  {data}\n")
+                wc   = str(line["write_count"]) if line["write_count"] > 0 else "—"
+                out.write(f"  {line['set']:>4}  {v}  {d}  {tag:<8}  {wc:>4}  {data}\n")
 
         # ── footer ────────────────────────────────────────────────────
         out.write("\n" + bar("═"))
@@ -1528,7 +1588,7 @@ class SimulatorGUI:
 
         # ── final cache state ─────────────────────────────────────────
         heading("Final Cache State")
-        w.writerow(["Set", "Way", "Valid", "Dirty", "Tag", "Data"])
+        w.writerow(["Set", "Way", "Valid", "Dirty", "Tag", "Write Count", "Data"])
         for line in ctrl.get_cache_snapshot():
             w.writerow([
                 line["set"],
@@ -1536,6 +1596,7 @@ class SimulatorGUI:
                 line["valid"],
                 line["dirty"],
                 line["tag"] if line["valid"] else "",
+                line["write_count"],
                 " ".join(line["data"]) if line["valid"] else "",
             ])
 
