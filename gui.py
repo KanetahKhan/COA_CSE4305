@@ -93,6 +93,10 @@ class SimulatorGUI:
         self._timeline_entries = []     # completed requests: {req_type,addr,hit,start,end}
         self._pending_req      = None   # in-flight: {req_type,addr,start} or None
 
+        # Address decomposition tooltip
+        self._tooltip_win  = None   # floating Toplevel or None
+        self._tooltip_addr = None   # address currently shown (avoid redundant redraws)
+
         # Preset scenarios
         self.preset_requests = {
             "Read Miss → Hit": [
@@ -495,7 +499,17 @@ class SimulatorGUI:
                                     bg=PANEL_BG, fg=DIM,
                                     font=("Consolas", 9), anchor=tk.W,
                                     wraplength=500, justify=tk.LEFT)
-        self.queue_label.pack(fill=tk.X, padx=8, pady=(0, 8))
+        self.queue_label.pack(fill=tk.X, padx=8, pady=(0, 2))
+
+        # Live address decomposition hint (updates as you type)
+        self.decomp_label = tk.Label(frame, text="",
+                                     bg=PANEL_BG, fg=DIM,
+                                     font=("Consolas", 8), anchor=tk.W,
+                                     wraplength=500, justify=tk.LEFT)
+        self.decomp_label.pack(fill=tk.X, padx=8, pady=(0, 6))
+
+        self.addr_entry.bind("<KeyRelease>", lambda _e: self._update_decomp_label())
+        self.addr_entry.bind("<FocusIn>",    lambda _e: self._update_decomp_label())
 
     def _build_log_panel(self, parent):
         frame = ttk.Frame(parent, style="Panel.TFrame")
@@ -511,6 +525,9 @@ class SimulatorGUI:
             relief=tk.FLAT, state=tk.DISABLED
         )
         self.log_text.pack(fill=tk.BOTH, expand=True, padx=8, pady=(2, 8))
+
+        self.log_text.bind("<Motion>", self._on_log_motion)
+        self.log_text.bind("<Leave>",  self._on_log_leave)
 
         self.log_text.tag_configure("hit",  foreground=GREEN)
         self.log_text.tag_configure("miss", foreground=RED)
@@ -909,6 +926,7 @@ class SimulatorGUI:
 
         self._refresh_all()
         self._log("Simulator reset. Ready.", "info")
+        self._update_decomp_label()
 
         # Snapshot cycle-0 so the user can step back to the very start
         self._history.append(self._take_snapshot())
@@ -1047,6 +1065,172 @@ class SimulatorGUI:
             c.create_text(cx, AXIS_Y + TICK_H + 2,
                           text=str(self.cycle),
                           fill=ACCENT, font=("Consolas", 7), anchor=tk.N)
+
+    # ------------------------------------------------------------------
+    # Address decomposition tooltip + live label
+    # ------------------------------------------------------------------
+
+    def _decompose_addr(self, addr):
+        """Return (tag, index, offset, tag_bits, index_bits, offset_bits)."""
+        ctrl = self.cache_ctrl
+        t, i, o = ctrl._decompose_address(addr)
+        return t, i, o, ctrl.tag_bits, ctrl.index_bits, ctrl.offset_bits
+
+    def _update_decomp_label(self):
+        """Refresh the live decomposition hint below the addr entry."""
+        try:
+            addr = int(self.addr_entry.get().strip(), 16)
+        except ValueError:
+            self.decomp_label.configure(text="", fg=DIM)
+            return
+
+        ctrl = self.cache_ctrl
+        tag, idx, off, tb, ib, ob = self._decompose_addr(addr)
+        bits   = ctrl.addr_bits
+        hi_tag = bits - 1
+        lo_tag = ob + ib
+        hi_idx = ob + ib - 1
+        hi_off = ob - 1
+
+        if ib > 0:
+            text = (f"0x{addr:04X}  →  "
+                    f"Tag[{hi_tag}:{lo_tag}]=0x{tag:X}  "
+                    f"Idx[{hi_idx}:{ob}]={idx}  "
+                    f"Off[{hi_off}:0]={off}")
+        else:
+            text = (f"0x{addr:04X}  →  "
+                    f"Tag[{hi_tag}:{ob}]=0x{tag:X}  "
+                    f"Off[{hi_off}:0]={off}  (fully assoc — no index)")
+        self.decomp_label.configure(text=text, fg=ACCENT)
+
+    def _get_log_addr_at(self, x, y):
+        """Return the integer address under mouse position in log_text, or None."""
+        import re
+        try:
+            idx        = self.log_text.index(f"@{x},{y}")
+            line_start = self.log_text.index(f"{idx} linestart")
+            line_end   = self.log_text.index(f"{idx} lineend")
+            line       = self.log_text.get(line_start, line_end)
+            col        = int(idx.split(".")[1])
+            for m in re.finditer(r'0x[0-9A-Fa-f]+', line):
+                if m.start() <= col <= m.end():
+                    val = int(m.group(), 16)
+                    if val < (1 << self.cache_ctrl.addr_bits):
+                        return val
+        except Exception:
+            pass
+        return None
+
+    def _on_log_motion(self, event):
+        addr = self._get_log_addr_at(event.x, event.y)
+        if addr is None:
+            self._hide_addr_tooltip()
+        elif addr != self._tooltip_addr:
+            self._show_addr_tooltip(addr, event.x_root, event.y_root)
+
+    def _on_log_leave(self, _event=None):
+        self._hide_addr_tooltip()
+
+    def _hide_addr_tooltip(self):
+        if self._tooltip_win and self._tooltip_win.winfo_exists():
+            self._tooltip_win.destroy()
+        self._tooltip_win  = None
+        self._tooltip_addr = None
+
+    def _show_addr_tooltip(self, addr, x_root, y_root):
+        self._hide_addr_tooltip()
+        self._tooltip_addr = addr
+
+        ctrl               = self.cache_ctrl
+        tag, idx, off, tb, ib, ob = self._decompose_addr(addr)
+        bits               = ctrl.addr_bits
+        binary             = f"{addr:0{bits}b}"
+
+        # Split raw binary into the three fields
+        tag_bin = binary[:tb]
+        idx_bin = binary[tb:tb + ib] if ib > 0 else ""
+        off_bin = binary[tb + ib:]
+
+        # Block-aligned address and bit-range strings
+        block_addr = addr & ~((1 << ob) - 1)
+        hi_tag     = bits - 1
+        lo_tag     = ob + ib
+        hi_idx     = ob + ib - 1
+        hi_off     = ob - 1
+
+        # ── build tooltip window ─────────────────────────────────────────
+        win = tk.Toplevel(self.root)
+        win.overrideredirect(True)
+        win.configure(bg="#11111b", relief=tk.SOLID, bd=1)
+        win.attributes("-topmost", True)
+        win.geometry(f"+{x_root + 18}+{y_root + 10}")
+
+        T = tk.Text(win, bg="#11111b", relief=tk.FLAT,
+                    font=("Consolas", 9), state=tk.NORMAL,
+                    width=48, height=1,   # height set after insert
+                    cursor="arrow", takefocus=False,
+                    padx=8, pady=6)
+        T.pack()
+
+        T.tag_configure("title",  foreground=ACCENT,    font=("Consolas", 9, "bold"))
+        T.tag_configure("sep",    foreground="#313244")
+        T.tag_configure("lbl",    foreground=DIM,       font=("Consolas", 9))
+        T.tag_configure("tag_f",  foreground=CYAN,      font=("Consolas", 9, "bold"))
+        T.tag_configure("idx_f",  foreground=YELLOW,    font=("Consolas", 9, "bold"))
+        T.tag_configure("off_f",  foreground=GREEN,     font=("Consolas", 9, "bold"))
+        T.tag_configure("plain",  foreground=TEXT_COLOR)
+
+        SEP = "─" * 42
+
+        # Line 1 — address + coloured binary
+        T.insert(tk.END, f"  0x{addr:04X}  =  ", "title")
+        T.insert(tk.END, tag_bin,  "tag_f")
+        if ib > 0:
+            T.insert(tk.END, " ", "sep")
+            T.insert(tk.END, idx_bin, "idx_f")
+        T.insert(tk.END, " ", "sep")
+        T.insert(tk.END, off_bin,  "off_f")
+        T.insert(tk.END, "\n")
+
+        # Line 2 — field-colour legend
+        T.insert(tk.END, "  ", "sep")
+        T.insert(tk.END, f"{'TAG':^{max(tb,3)}}", "tag_f")
+        if ib > 0:
+            T.insert(tk.END, " ", "sep")
+            T.insert(tk.END, f"{'IX':^{max(ib,2)}}", "idx_f")
+        T.insert(tk.END, " ", "sep")
+        T.insert(tk.END, f"{'OF':^{max(ob,2)}}", "off_f")
+        T.insert(tk.END, "\n")
+
+        # Line 3 — separator
+        T.insert(tk.END, f"  {SEP}\n", "sep")
+
+        # Lines 4-6 — numeric breakdown
+        T.insert(tk.END, f"  Tag    [{hi_tag:2d}:{lo_tag:2d}]  ", "lbl")
+        T.insert(tk.END, f"0b{tag_bin:<{tb}}  =  0x{tag:X}  ({tb}b)\n", "tag_f")
+
+        if ib > 0:
+            T.insert(tk.END, f"  Index  [{hi_idx:2d}:{ob:2d}]  ", "lbl")
+            T.insert(tk.END, f"0b{idx_bin:<{ib}}  =  {idx}  ({ib}b)\n", "idx_f")
+
+        T.insert(tk.END, f"  Offset [{hi_off:2d}: 0]  ", "lbl")
+        T.insert(tk.END, f"0b{off_bin:<{ob}}  =  {off}  ({ob}b)\n", "off_f")
+
+        # Line — separator + result
+        T.insert(tk.END, f"  {SEP}\n", "sep")
+        T.insert(tk.END, f"  Block: 0x{block_addr:04X}", "plain")
+        if ib > 0:
+            T.insert(tk.END, f"  ·  Set: {idx}", "plain")
+        T.insert(tk.END, "\n")
+
+        # Fix height to content
+        lines = int(T.index(tk.END).split(".")[0])
+        T.configure(state=tk.DISABLED, height=lines - 1)
+
+        self._tooltip_win = win
+
+        # Keep tooltip alive while mouse stays in the log widget; destroy on focus loss
+        win.bind("<Enter>", lambda _e: None)   # don't steal events
 
     def _open_memory_window(self):
         """Open (or bring to front) the memory map window."""
