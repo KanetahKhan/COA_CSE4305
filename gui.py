@@ -13,7 +13,7 @@ Tkinter-based visual simulator showing:
 """
 
 import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext
+from tkinter import ttk, messagebox, scrolledtext, filedialog
 import sys
 import os
 
@@ -21,6 +21,9 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 import math
 import copy
+import csv
+import io
+import datetime
 from cache_controller import CacheController, State, RequestType, Policy
 from memory import Memory
 from cpu import CPU
@@ -323,6 +326,11 @@ class SimulatorGUI:
 
         tk.Button(row2, text="🗺 Mem", command=self._open_memory_window,
                   bg="#45475a", fg=CYAN,
+                  font=("Consolas", 10, "bold"),
+                  relief=tk.FLAT, padx=12, pady=4).pack(side=tk.LEFT, padx=(0, 4))
+
+        tk.Button(row2, text="📄 Export", command=self._export_report,
+                  bg="#45475a", fg=GREEN,
                   font=("Consolas", 10, "bold"),
                   relief=tk.FLAT, padx=12, pady=4).pack(side=tk.LEFT, padx=(0, 12))
 
@@ -1231,6 +1239,280 @@ class SimulatorGUI:
 
         # Keep tooltip alive while mouse stays in the log widget; destroy on focus loss
         win.bind("<Enter>", lambda _e: None)   # don't steal events
+
+    # ------------------------------------------------------------------
+    # Export simulation report
+    # ------------------------------------------------------------------
+
+    def _export_report(self):
+        """Ask where to save, then write TXT or CSV based on chosen extension."""
+        path = filedialog.asksaveasfilename(
+            title="Export Simulation Report",
+            defaultextension=".txt",
+            filetypes=[
+                ("Text report",   "*.txt"),
+                ("CSV spreadsheet", "*.csv"),
+                ("All files",     "*.*"),
+            ],
+            initialfile="cache_sim_report",
+        )
+        if not path:
+            return
+
+        try:
+            if path.lower().endswith(".csv"):
+                content = self._build_csv_report()
+            else:
+                content = self._build_txt_report()
+
+            with open(path, "w", encoding="utf-8", newline="") as fh:
+                fh.write(content)
+
+            messagebox.showinfo("Export Complete",
+                                f"Report saved to:\n{path}")
+        except Exception as exc:
+            messagebox.showerror("Export Failed", str(exc))
+
+    # ── TXT report ────────────────────────────────────────────────────
+
+    def _build_txt_report(self):
+        ctrl  = self.cache_ctrl
+        stats = ctrl.get_stats()
+        W     = 80   # page width
+        now   = datetime.datetime.now().strftime("%Y-%m-%d  %H:%M:%S")
+
+        def bar(ch="─"):
+            return ch * W + "\n"
+
+        def section(title):
+            return f"\n{title}\n{bar()}"
+
+        out = io.StringIO()
+
+        # ── header ────────────────────────────────────────────────────
+        out.write(bar("═"))
+        title = "CACHE CONTROLLER FSM SIMULATOR — SIMULATION REPORT"
+        out.write(title.center(W) + "\n")
+        out.write(f"Generated: {now}".center(W) + "\n")
+        out.write(bar("═"))
+
+        # ── configuration ─────────────────────────────────────────────
+        out.write(section("CONFIGURATION"))
+        assoc = ctrl.associativity
+        if assoc == 1:
+            assoc_str = "Direct-Mapped"
+            policy_str = "Direct-Mapped"
+        else:
+            assoc_str  = f"{assoc}-way Set-Associative"
+            policy_str = ctrl.policy.value
+
+        out.write(f"  Cache Lines   : {ctrl.num_lines}\n")
+        out.write(f"  Block Size    : {ctrl.block_size} words\n")
+        out.write(f"  Address Bits  : {ctrl.addr_bits}\n")
+        out.write(f"  Associativity : {assoc_str}\n")
+        out.write(f"  Sets          : {ctrl.num_sets}\n")
+        out.write(f"  Replacement   : {policy_str}\n")
+        out.write(f"  Tag Bits      : {ctrl.tag_bits}   "
+                  f"Index Bits : {ctrl.index_bits}   "
+                  f"Offset Bits : {ctrl.offset_bits}\n")
+        out.write(f"  Write Policy  : Write-Back, Write-Allocate\n")
+
+        # ── statistics ────────────────────────────────────────────────
+        out.write(section("PERFORMANCE STATISTICS"))
+        out.write(f"  Total Requests : {stats['total_requests']}\n")
+        misses = stats['misses']
+        hits   = stats['hits']
+        total  = stats['total_requests'] or 1
+        out.write(f"  Cache Hits     : {hits}  ({hits/total*100:.1f}%)\n")
+        out.write(f"  Cache Misses   : {misses}  ({misses/total*100:.1f}%)\n")
+        out.write(f"  Hit Rate       : {stats['hit_rate']}\n")
+        out.write(f"  Total Cycles   : {stats['total_cycles']}\n")
+
+        # ── request timeline ──────────────────────────────────────────
+        out.write(section("REQUEST TIMELINE"))
+        if self._timeline_entries:
+            hdr = f"  {'#':>3}  {'Type':<6}  {'Address':<9}  {'Result':<6}  {'Start':>6}  {'End':>6}  {'Cycles':>7}\n"
+            out.write(hdr)
+            out.write("  " + "─" * (len(hdr) - 3) + "\n")
+            for i, e in enumerate(self._timeline_entries, 1):
+                rw     = "READ " if e["req_type"] == RequestType.READ else "WRITE"
+                result = "HIT  " if e["hit"] else "MISS "
+                cy     = e["end"] - e["start"]
+                out.write(f"  {i:>3}  {rw:<6}  "
+                          f"0x{e['addr']:04X}     "
+                          f"{result:<6}  "
+                          f"{e['start']:>6}  {e['end']:>6}  {cy:>7}\n")
+        else:
+            out.write("  (no requests completed)\n")
+
+        # ── CPU results ───────────────────────────────────────────────
+        out.write(section("CPU RESULTS"))
+        if self.cpu.results:
+            for i, r in enumerate(self.cpu.results):
+                if r["type"] == RequestType.READ:
+                    out.write(f"  [{i}] READ   addr=0x{r['address']:04X}"
+                              f"  =>  data=0x{r['data_returned']:02X}\n")
+                else:
+                    out.write(f"  [{i}] WRITE  addr=0x{r['address']:04X}"
+                              f"  =>  OK\n")
+        else:
+            out.write("  (no results yet)\n")
+
+        # ── cycle trace ───────────────────────────────────────────────
+        out.write(section("CYCLE TRACE"))
+        if ctrl.log:
+            col_w = [7, 13, 13, 24, 0]   # last col fills remainder
+            hdr_cols = ["Cycle", "Prev State", "Curr State", "Event", "Details"]
+            row_fmt = ("  {:<{w0}}  {:<{w1}}  {:<{w2}}  {:<{w3}}  {}\n")
+
+            out.write(row_fmt.format(*hdr_cols,
+                                     w0=col_w[0], w1=col_w[1],
+                                     w2=col_w[2], w3=col_w[3]))
+            out.write("  " + "─" * (W - 2) + "\n")
+            for entry in ctrl.log:
+                out.write(row_fmt.format(
+                    entry["cycle"],
+                    entry["prev_state"],
+                    entry["state"],
+                    entry["event"],
+                    entry["details"],
+                    w0=col_w[0], w1=col_w[1],
+                    w2=col_w[2], w3=col_w[3],
+                ))
+        else:
+            out.write("  (no cycles executed)\n")
+
+        # ── final cache state ─────────────────────────────────────────
+        out.write(section("FINAL CACHE STATE"))
+        snap = ctrl.get_cache_snapshot()
+        if ctrl.associativity > 1:
+            out.write(f"  {'Set':>4}  {'Way':>4}  {'V':>1}  {'D':>1}  {'Tag':<8}  {'Block Data'}\n")
+            out.write("  " + "─" * 50 + "\n")
+            for line in snap:
+                v    = "1" if line["valid"] else "0"
+                d    = "1" if line["dirty"] else "0"
+                tag  = line["tag"] if line["valid"] else "—"
+                data = " ".join(line["data"]) if line["valid"] else "(empty)"
+                out.write(f"  {line['set']:>4}  {line['way']:>4}  {v}  {d}  {tag:<8}  {data}\n")
+        else:
+            out.write(f"  {'Set':>4}  {'V':>1}  {'D':>1}  {'Tag':<8}  {'Block Data'}\n")
+            out.write("  " + "─" * 46 + "\n")
+            for line in snap:
+                v    = "1" if line["valid"] else "0"
+                d    = "1" if line["dirty"] else "0"
+                tag  = line["tag"] if line["valid"] else "—"
+                data = " ".join(line["data"]) if line["valid"] else "(empty)"
+                out.write(f"  {line['set']:>4}  {v}  {d}  {tag:<8}  {data}\n")
+
+        # ── footer ────────────────────────────────────────────────────
+        out.write("\n" + bar("═"))
+        out.write("End of Report".center(W) + "\n")
+        out.write(bar("═"))
+
+        return out.getvalue()
+
+    # ── CSV report ────────────────────────────────────────────────────
+
+    def _build_csv_report(self):
+        ctrl  = self.cache_ctrl
+        stats = ctrl.get_stats()
+        now   = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        out = io.StringIO()
+        w   = csv.writer(out)
+
+        def blank():
+            w.writerow([])
+
+        def heading(title):
+            blank()
+            w.writerow([f"=== {title} ==="])
+
+        # ── metadata ──────────────────────────────────────────────────
+        w.writerow(["Cache Controller FSM Simulator — Report"])
+        w.writerow(["Generated", now])
+
+        # ── configuration ─────────────────────────────────────────────
+        heading("Configuration")
+        assoc = ctrl.associativity
+        w.writerow(["Cache Lines",   ctrl.num_lines])
+        w.writerow(["Block Size",    ctrl.block_size])
+        w.writerow(["Address Bits",  ctrl.addr_bits])
+        w.writerow(["Associativity", assoc if assoc > 1 else "Direct-Mapped"])
+        w.writerow(["Sets",          ctrl.num_sets])
+        w.writerow(["Replacement",   ctrl.policy.value])
+        w.writerow(["Tag Bits",      ctrl.tag_bits])
+        w.writerow(["Index Bits",    ctrl.index_bits])
+        w.writerow(["Offset Bits",   ctrl.offset_bits])
+        w.writerow(["Write Policy",  "Write-Back Write-Allocate"])
+
+        # ── statistics ────────────────────────────────────────────────
+        heading("Performance Statistics")
+        w.writerow(["Metric", "Value"])
+        w.writerow(["Total Requests", stats["total_requests"]])
+        w.writerow(["Cache Hits",     stats["hits"]])
+        w.writerow(["Cache Misses",   stats["misses"]])
+        w.writerow(["Hit Rate",       stats["hit_rate"]])
+        w.writerow(["Total Cycles",   stats["total_cycles"]])
+
+        # ── request timeline ──────────────────────────────────────────
+        heading("Request Timeline")
+        w.writerow(["#", "Type", "Address", "Result",
+                    "Start Cycle", "End Cycle", "Cycles Used"])
+        for i, e in enumerate(self._timeline_entries, 1):
+            w.writerow([
+                i,
+                "READ" if e["req_type"] == RequestType.READ else "WRITE",
+                f"0x{e['addr']:04X}",
+                "HIT" if e["hit"] else "MISS",
+                e["start"],
+                e["end"],
+                e["end"] - e["start"],
+            ])
+
+        # ── CPU results ───────────────────────────────────────────────
+        heading("CPU Results")
+        w.writerow(["#", "Type", "Address", "Data Returned"])
+        for i, r in enumerate(self.cpu.results):
+            data = f"0x{r['data_returned']:02X}" if r["data_returned"] is not None else "—"
+            w.writerow([
+                i,
+                "READ" if r["type"] == RequestType.READ else "WRITE",
+                f"0x{r['address']:04X}",
+                data,
+            ])
+
+        # ── cycle trace ───────────────────────────────────────────────
+        heading("Cycle Trace")
+        w.writerow(["Cycle", "Prev State", "Curr State", "Event",
+                    "Details", "CPU Ready", "CPU Stall", "Mem Read", "Mem Write"])
+        for entry in ctrl.log:
+            w.writerow([
+                entry["cycle"],
+                entry["prev_state"],
+                entry["state"],
+                entry["event"],
+                entry["details"],
+                entry["cpu_ready"],
+                entry["cpu_stall"],
+                entry["mem_read"],
+                entry["mem_write"],
+            ])
+
+        # ── final cache state ─────────────────────────────────────────
+        heading("Final Cache State")
+        w.writerow(["Set", "Way", "Valid", "Dirty", "Tag", "Data"])
+        for line in ctrl.get_cache_snapshot():
+            w.writerow([
+                line["set"],
+                line["way"],
+                line["valid"],
+                line["dirty"],
+                line["tag"] if line["valid"] else "",
+                " ".join(line["data"]) if line["valid"] else "",
+            ])
+
+        return out.getvalue()
 
     def _open_memory_window(self):
         """Open (or bring to front) the memory map window."""
