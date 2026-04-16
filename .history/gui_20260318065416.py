@@ -317,7 +317,6 @@ class SimulatorGUI:
         self.fsm_canvas = tk.Canvas(parent, bg="#0d0d18",
                                     highlightthickness=0, height=370)
         self.fsm_canvas.pack(fill=tk.BOTH, expand=True, padx=0, pady=(0, 0))
-        self.fsm_canvas.bind("<Configure>", lambda _e: self._draw_fsm())
 
     def _build_signals_panel(self, parent):
         frame = tk.Frame(parent, bg=PANEL_BG,
@@ -667,8 +666,8 @@ class SimulatorGUI:
         c = self.fsm_canvas
         c.delete("all")
 
-        w = c.winfo_width()  if c.winfo_width()  > 1 else 420
-        h = c.winfo_height() if c.winfo_height() > 1 else 370
+        w = c.winfo_width()  or 420
+        h = c.winfo_height() or 370
 
         # ── dot-grid background ──────────────────────────────────────
         for xi in range(14, w, 22):
