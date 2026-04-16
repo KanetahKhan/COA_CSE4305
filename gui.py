@@ -29,6 +29,7 @@ from memory import Memory
 from cpu import CPU
 from compare_window import CompareWindow
 from memory_window import MemoryWindow
+from dataflow_window import DataFlowWindow
 
 
 STATE_COLORS = {
@@ -98,6 +99,9 @@ class SimulatorGUI:
         self._log_items = []      # (line_text, tag) pairs mirroring the log widget
         self._hist_pos  = -1      # current position in _history
         self._scrubbing = False   # suppress re-entry in _on_scrub
+
+        # Data flow animation window state
+        self._dataflow_window  = None   # DataFlowWindow toplevel (or None if closed)
 
         # Memory map window state
         self._mem_window       = None   # MemoryWindow toplevel (or None if closed)
@@ -459,6 +463,9 @@ class SimulatorGUI:
 
         btn(row2, "🗺 Mem",    self._open_memory_window,
             CYAN,   "#122030", "#1a3040").pack(side=tk.LEFT, padx=(0, 3))
+
+        btn(row2, "⚡ Flow",  self._open_dataflow_window,
+            PEACH,  "#2a1a10", "#3c2818").pack(side=tk.LEFT, padx=(0, 3))
 
         btn(row2, "📄 Export", self._export_report,
             TEAL,   "#122820", "#1a3c2c").pack(side=tk.LEFT, padx=(0, 3))
@@ -987,6 +994,7 @@ class SimulatorGUI:
         self._update_queue_display()
         self.config_label.configure(text=self._config_str())
         self._update_memory_window()
+        self._update_dataflow_window()
         self._update_timeline()
 
     # ------------------------------------------------------------------
@@ -1111,6 +1119,7 @@ class SimulatorGUI:
         self._update_signals()
         self._update_stats()
         self._update_memory_window()
+        self._update_dataflow_window()
         self._update_timeline()
 
         if self.cpu.is_done() and self.cache_ctrl.state == State.IDLE:
@@ -1872,6 +1881,22 @@ class SimulatorGUI:
             self._mem_wb_block,
         )
 
+    def _open_dataflow_window(self):
+        """Open (or bring to front) the data flow animation window."""
+        if self._dataflow_window is None or not self._dataflow_window.winfo_exists():
+            self._dataflow_window = DataFlowWindow(self.root)
+        else:
+            self._dataflow_window.lift()
+        self._update_dataflow_window()
+
+    def _update_dataflow_window(self):
+        """Push current state to the data flow window if it is open."""
+        if self._dataflow_window is None or not self._dataflow_window.winfo_exists():
+            return
+        self._dataflow_window.update_display(
+            self.cache_ctrl, self.memory, self.cpu, self.cycle
+        )
+
     # ------------------------------------------------------------------
     # Settings dialog
     # ------------------------------------------------------------------
@@ -2140,6 +2165,7 @@ class SimulatorGUI:
         self._update_stats()
         self._update_history_scrubber()
         self._update_memory_window()
+        self._update_dataflow_window()
         self._update_timeline()
 
     def _step_back(self):
