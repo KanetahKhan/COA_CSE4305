@@ -251,6 +251,9 @@ class SimulatorGUI:
             addr_bits=self._cfg_addr_bits,
             associativity=assoc, policy=policy,
             base_cpi=self._cfg_base_cpi,
+            write_policy=self._cfg_write_policy,
+            allocate_policy=self._cfg_allocate_policy,
+            victim_cache_size=self._cfg_victim_size,
         )
         self.cache_ctrl.set_write_buffer_stats(0, 0, self._cfg_wb_size)
         if self._cfg_enable_l2:
@@ -2083,6 +2086,9 @@ class SimulatorGUI:
         v_l2_lat = tk.IntVar(value=self._cfg_l2_latency)
         v_base_cpi = tk.DoubleVar(value=self._cfg_base_cpi)
         v_wb_size = tk.IntVar(value=self._cfg_wb_size)
+        v_write_policy = tk.StringVar(value=self._cfg_write_policy.value)
+        v_alloc_policy = tk.StringVar(value=self._cfg_allocate_policy.value)
+        v_victim_size  = tk.IntVar(value=self._cfg_victim_size)
 
         def lbl(parent, text, fg=DIM):
             return tk.Label(parent, text=text, bg=PANEL_BG, fg=fg,
@@ -2197,9 +2203,39 @@ class SimulatorGUI:
         lbl(hsect, "L2 latency (cycles)").grid(row=3, column=0, sticky=tk.W, **pad)
         spinbox(hsect, v_l2_lat).grid(row=3, column=1, sticky=tk.W)
 
+        # Section: Write policy + Victim cache
+        psect = tk.Frame(outer, bg=PANEL_BG, padx=10, pady=8)
+        psect.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+
+        tk.Label(psect, text="Write Policy & Victim Cache",
+                 bg=PANEL_BG, fg=ACCENT,
+                 font=("Consolas", 10, "bold")).grid(
+                     row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 6))
+
+        lbl(psect, "Write-hit policy").grid(row=1, column=0, sticky=tk.W, **pad)
+        wp_cb = ttk.Combobox(psect, textvariable=v_write_policy,
+                             values=WRITE_POLICY_OPTIONS, state="readonly", width=14)
+        wp_cb.grid(row=1, column=1, sticky=tk.W)
+        wp_cb.bind("<<ComboboxSelected>>", lambda _e: refresh_preview())
+
+        lbl(psect, "Write-miss policy").grid(row=2, column=0, sticky=tk.W, **pad)
+        ap_cb = ttk.Combobox(psect, textvariable=v_alloc_policy,
+                             values=ALLOCATE_POLICY_OPTIONS, state="readonly", width=18)
+        ap_cb.grid(row=2, column=1, sticky=tk.W)
+        ap_cb.bind("<<ComboboxSelected>>", lambda _e: refresh_preview())
+
+        lbl(psect, "Victim cache size").grid(row=3, column=0, sticky=tk.W, **pad)
+        vc_spin = tk.Spinbox(psect, textvariable=v_victim_size,
+                             from_=0, to=8, width=5, bg="#45475a", fg=TEXT_COLOR,
+                             font=("Consolas", 9), buttonbackground="#45475a",
+                             command=lambda: refresh_preview())
+        vc_spin.bind("<KeyRelease>", lambda _e: refresh_preview())
+        vc_spin.grid(row=3, column=1, sticky=tk.W)
+        lbl(psect, "(0 = disabled)").grid(row=3, column=2, sticky=tk.W, padx=(4, 0))
+
         # Section: Live bit-field preview
         prev_frame = tk.Frame(outer, bg=PANEL_BG, padx=10, pady=8)
-        prev_frame.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+        prev_frame.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(0, 6))
 
         tk.Label(prev_frame, text="Address Bit-Field Preview", bg=PANEL_BG, fg=ACCENT,
                  font=("Consolas", 10, "bold")).pack(anchor=tk.W, pady=(0, 4))
@@ -2266,7 +2302,7 @@ class SimulatorGUI:
 
         # ── buttons ────────────────────────────────────────────────────
         btn_row = tk.Frame(outer, bg=BG_COLOR)
-        btn_row.grid(row=5, column=0, columnspan=3, pady=(6, 0), sticky="e")
+        btn_row.grid(row=6, column=0, columnspan=3, pady=(6, 0), sticky="e")
 
         tk.Label(btn_row,
                  text="⚠ Applying will reset the simulation.",
@@ -2290,6 +2326,9 @@ class SimulatorGUI:
                                   int(v_l2_lat.get()),
                                   float(v_base_cpi.get()),
                                   int(v_wb_size.get()),
+                                  v_write_policy.get(),
+                                  v_alloc_policy.get(),
+                                  int(v_victim_size.get()),
                               ),
                               bg="#45475a", fg=GREEN,
                               font=("Consolas", 9, "bold"),
@@ -2304,7 +2343,8 @@ class SimulatorGUI:
 
     def _apply_settings(self, dlg, num_lines, block_size, addr_bits,
                         read_lat, write_lat, enable_l2, l2_lines, l2_latency,
-                        base_cpi, wb_size):
+                        base_cpi, wb_size,
+                        write_policy_str, allocate_policy_str, victim_size):
         """Validate, store config, close dialog, reset simulation."""
         assoc = self._current_associativity()
 
@@ -2348,6 +2388,13 @@ class SimulatorGUI:
                 parent=dlg)
             return
 
+        if victim_size < 0 or victim_size > 8:
+            messagebox.showerror(
+                "Invalid Configuration",
+                "Victim cache size must be between 0 and 8.",
+                parent=dlg)
+            return
+
         self._cfg_num_lines  = num_lines
         self._cfg_block_size = block_size
         self._cfg_addr_bits  = addr_bits
@@ -2358,6 +2405,11 @@ class SimulatorGUI:
         self._cfg_l2_latency = l2_latency
         self._cfg_base_cpi   = base_cpi
         self._cfg_wb_size    = wb_size
+        self._cfg_write_policy    = _WRITE_POLICY_MAP.get(
+            write_policy_str, WritePolicy.WRITE_BACK)
+        self._cfg_allocate_policy = _ALLOCATE_POLICY_MAP.get(
+            allocate_policy_str, AllocatePolicy.WRITE_ALLOCATE)
+        self._cfg_victim_size     = victim_size
 
         dlg.destroy()
         self._reset()

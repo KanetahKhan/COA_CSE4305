@@ -3,7 +3,18 @@
     "allow": [
       "Bash(python -c ':*)",
       "Bash(python -m pytest tests/ -v)",
-      "Bash(python tests/test_verify.py)"
+      "Bash(python tests/test_verify.py)",
+      "Bash(python main.py --test 1)",
+      "Bash(PYTHONIOENCODING=utf-8 python main.py --test 1)",
+      "Bash(sed 's/\\\\x1b\\\\[[0-9;]*m//g')",
+      "Read(//tmp/**)",
+      "Bash(PYTHONIOENCODING=utf-8 python main.py --test 2)",
+      "Bash(PYTHONIOENCODING=utf-8 python main.py --test 3)",
+      "Bash(PYTHONIOENCODING=utf-8 python main.py --test 4)",
+      "Bash(PYTHONIOENCODING=utf-8 python main.py --test 5)",
+      "Bash(PYTHONIOENCODING=utf-8 python main.py --test 6)",
+      "Bash(wc -l /tmp/test*.txt)",
+      "Bash(python -c \"import gui; print\\('GUI module imports OK'\\)\")"
     ]
   }
 }

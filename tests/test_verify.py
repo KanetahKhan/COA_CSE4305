@@ -5,7 +5,7 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from cache_controller import RequestType
+from cache_controller import RequestType, WritePolicy, AllocatePolicy
 from simulator import Simulator
 
 R = RequestType.READ
@@ -223,6 +223,96 @@ def test_local_vs_global_miss_rates():
     check_close("L2 global miss rate", stats["l2_global_miss_rate_value"], 2 / 5)
 
 
+def test_write_through_keeps_line_clean():
+    print("\n[Test 13] Write-through hit keeps line clean")
+    sim = Simulator(
+        write_policy=WritePolicy.WRITE_THROUGH,
+        allocate_policy=AllocatePolicy.WRITE_ALLOCATE,
+        verbose=False,
+    )
+    sim.init_memory(0x0100, [0xAA, 0xBB, 0xCC, 0xDD])
+    # First read brings the block in; second access writes to it.
+    result = sim.run([(R, 0x0100, 0), (W, 0x0102, 0xEE)])
+
+    snap = sim.cache_ctrl.get_cache_snapshot()
+    line0 = snap[0]
+    check("L1 line valid",        line0["valid"], True)
+    check("L1 line stays clean",  line0["dirty"], False)
+    check("Write reached memory", sim.memory.read_word(0x0102), 0xEE)
+    check("Write-through count",  result["stats"]["write_through_writes"], 1)
+    events = [e["event"] for e in result["log"]]
+    check("Write-through event logged",
+          any("WRITE_THROUGH_ENQUEUE" in e or "WRITE_THROUGH" in e for e in events),
+          True)
+
+
+def test_no_write_allocate_bypass():
+    print("\n[Test 14] No-write-allocate bypasses L1 on write miss")
+    sim = Simulator(
+        write_policy=WritePolicy.WRITE_THROUGH,
+        allocate_policy=AllocatePolicy.NO_WRITE_ALLOCATE,
+        verbose=False,
+    )
+    sim.init_memory(0x0200, [0x10, 0x20, 0x30, 0x40])
+    # Pure write miss; no L1 line should be installed for this block.
+    result = sim.run([(W, 0x0202, 0xFF)])
+    stats = result["stats"]
+
+    snap = sim.cache_ctrl.get_cache_snapshot()
+    valid_count = sum(1 for s in snap if s["valid"])
+    check("No L1 line installed",          valid_count, 0)
+    check("Write reached memory",          sim.memory.read_word(0x0202), 0xFF)
+    check("Other words preserved",         sim.memory.read_word(0x0200), 0x10)
+    check("No-allocate bypass counter",    stats["no_allocate_bypass"], 1)
+    check("Cache marks the access a miss", stats["misses"], 1)
+
+
+def test_victim_cache_catches_conflict():
+    print("\n[Test 15] Victim cache turns conflict miss into a hit")
+    # Direct-mapped, single line — every distinct block conflicts.
+    sim_no_vc = Simulator(num_cache_lines=1, victim_cache_size=0, verbose=False)
+    sim_vc    = Simulator(num_cache_lines=1, victim_cache_size=2, verbose=False)
+    for sim in (sim_no_vc, sim_vc):
+        sim.init_memory(0x0000, [0x11, 0x22, 0x33, 0x44])
+        sim.init_memory(0x0100, [0xAA, 0xBB, 0xCC, 0xDD])
+
+    # Pattern that thrashes a 1-line cache: A, B, A again.
+    pattern = [(R, 0x0000, 0), (R, 0x0100, 0), (R, 0x0000, 0)]
+    no_vc = sim_no_vc.run(list(pattern))
+    vc    = sim_vc.run(list(pattern))
+
+    check("Without victim cache: 3 L1 misses",   no_vc["stats"]["misses"], 3)
+    check("Without victim cache: zero VC hits",   no_vc["stats"]["victim_hits"], 0)
+    check("Victim cache records a hit",           vc["stats"]["victim_hits"], 1)
+    check("Third read still returns 0x11",        vc["results"][2]["data_returned"], 0x11)
+    # Victim hits still count as L1 misses (L1 array didn't hold the block),
+    # but they short-circuit the trip to L2/memory, so the cycle count drops.
+    check("Victim path saves cycles",
+          vc["stats"]["total_cycles"] < no_vc["stats"]["total_cycles"], True)
+
+
+def test_victim_cache_preserves_dirty():
+    print("\n[Test 16] Dirty block survives an L1 eviction via victim cache")
+    sim = Simulator(num_cache_lines=1, victim_cache_size=2, verbose=False)
+    sim.init_memory(0x0000, [0x11, 0x22, 0x33, 0x44])
+    sim.init_memory(0x0100, [0xAA, 0xBB, 0xCC, 0xDD])
+
+    # Write to A (dirties L1); access B (evicts A into victim, dirty);
+    # access A again (victim swap reinstalls dirty A).
+    result = sim.run([(W, 0x0001, 0xEE), (R, 0x0100, 0), (R, 0x0001, 0)])
+
+    check("Re-read sees the dirty value",   result["results"][2]["data_returned"], 0xEE)
+    # Dirty data lives in L1 after the swap-back (no L2 here, and main memory
+    # was never updated because we never drained), so check L1 directly.
+    snap = sim.cache_ctrl.get_cache_snapshot()
+    line0 = snap[0]
+    check("L1 line valid+dirty after swap",
+          line0["valid"] and line0["dirty"], True)
+    check("L1 line holds the dirty byte",   line0["data"][1], "0xEE")
+    check("Main memory not yet updated",    sim.memory.read_word(0x0001), 0x22)
+    check("Victim cache fielded the swap",  result["stats"]["victim_swaps"], 1)
+
+
 if __name__ == "__main__":
     print("\033[1m=== Cache FSM Simulator - Automated Tests ===\033[0m")
 
@@ -238,6 +328,10 @@ if __name__ == "__main__":
     test_l2_hit_after_l1_eviction()
     test_l2_writeback_retains_dirty_block()
     test_local_vs_global_miss_rates()
+    test_write_through_keeps_line_clean()
+    test_no_write_allocate_bypass()
+    test_victim_cache_catches_conflict()
+    test_victim_cache_preserves_dirty()
 
     print(f"\n\033[1mResults: {passed} passed, {failed} failed\033[0m")
     if failed:

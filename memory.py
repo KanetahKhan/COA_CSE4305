@@ -367,8 +367,10 @@ class HierarchicalMemory:
                              + (self.main_memory.write_latency if self._pending_victim else 0))
 
     def start_write_partial(self, address, value):
-        """Single-word write that bypasses L2 (write-no-allocate / write-through
-        partial). Routes straight to main memory."""
+        """Single-word write (write-through / no-write-allocate). Always
+        propagates to main memory; if L2 happens to hold the containing
+        block, patch the word in place too so L2 stays coherent with the
+        write-through update."""
         if self.busy:
             return
 
@@ -385,6 +387,13 @@ class HierarchicalMemory:
         self._prepared_fill = None
         self.partial_writes += 1
         self.write_latency = self.main_memory.write_latency
+
+        # Patch L2 in place (no extra latency — coherence-only).
+        l2_tag, l2_set, l2_offset = self.l2._decompose_address(address)
+        l2_way = self.l2._find_hit_way(l2_set, l2_tag)
+        if l2_way >= 0:
+            self.l2.cache[l2_set][l2_way].data[l2_offset] = int(value) & 0xFF
+
         self.main_memory.start_write_partial(address, value)
         self.main_memory_writes += 1
 
