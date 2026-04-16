@@ -1701,8 +1701,6 @@ class SimulatorGUI:
         out.write(f"  Stall Cycles   : {stats['stall_cycles']}\n")
         out.write(f"  Bus Reads      : {stats['bus_reads']}  (allocations)\n")
         out.write(f"  Bus Writes     : {stats['bus_writes']}  (write-backs)\n")
-        out.write(f"  Write Buffer   : depth={stats['write_buffer_depth']}/{stats['write_buffer_size']}"
-              f"  max={stats['write_buffer_max_occupancy']}\n")
         out.write(f"  Avg Miss Pen.  : {stats['avg_miss_penalty']} cycles\n")
         out.write(f"  AMAT           : {stats['amat']} cycles  "
                   f"(Hit Time + Miss Rate x Miss Penalty)\n")
@@ -1849,9 +1847,6 @@ class SimulatorGUI:
         w.writerow(["Stall Cycles",      stats["stall_cycles"]])
         w.writerow(["Bus Reads",         stats["bus_reads"]])
         w.writerow(["Bus Writes",        stats["bus_writes"]])
-        w.writerow(["Write Buffer Depth", stats["write_buffer_depth"]])
-        w.writerow(["Write Buffer Max Occupancy", stats["write_buffer_max_occupancy"]])
-        w.writerow(["Write Buffer Size",  stats["write_buffer_size"]])
         w.writerow(["Avg Miss Penalty",  stats["avg_miss_penalty"]])
         w.writerow(["AMAT (cycles)",     stats["amat"]])
         w.writerow(["Base CPI",          stats["base_cpi"]])

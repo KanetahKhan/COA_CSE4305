@@ -230,7 +230,6 @@ class SimulatorGUI:
             associativity=assoc, policy=policy,
             base_cpi=self._cfg_base_cpi,
         )
-        self.cache_ctrl.set_write_buffer_stats(0, 0, self._cfg_wb_size)
         self.memory          = Memory(
             size=2 ** self._cfg_addr_bits,
             block_size=self._cfg_block_size,
@@ -567,13 +566,11 @@ class SimulatorGUI:
         ab    = self._cfg_addr_bits
         if assoc == 1:
             return (f"Config: Direct-Mapped  |  {nl} lines  |  "
-                f"block={bs}  |  {ab}-bit addr  |  Base CPI={self._cfg_base_cpi:.2f}"
-                f"  |  WB={self._cfg_wb_size}")
+                f"block={bs}  |  {ab}-bit addr  |  Base CPI={self._cfg_base_cpi:.2f}")
         pol  = self.policy_var.get()
         sets = nl // assoc
         return (f"Config: {assoc}-way Set-Assoc  |  {sets} sets × {assoc} ways  |  "
-            f"Policy: {pol}  |  block={bs}  |  {ab}-bit addr  |  Base CPI={self._cfg_base_cpi:.2f}"
-            f"  |  WB={self._cfg_wb_size}")
+            f"Policy: {pol}  |  block={bs}  |  {ab}-bit addr  |  Base CPI={self._cfg_base_cpi:.2f}")
 
     def _build_cache_panel(self, parent):
         frame = parent  # parent is already a styled Frame from _build_ui
@@ -985,8 +982,7 @@ class SimulatorGUI:
             text=(f"Hits: {stats['hits']}  ·  Misses: {stats['misses']} "
                   f"(cold:{comp} repl:{conf})  ·  Rate: {rate}  ·  "
                   f"AMAT: {amat}  ·  Stalls: {stats['stall_cycles']}  ·  "
-                  f"Eff CPI: {eff_cpi}  ·  IPC: {ipc} ({tput})  ·  "
-                  f"WB: {stats['write_buffer_depth']}/{stats['write_buffer_size']}"))
+                  f"Eff CPI: {eff_cpi}  ·  IPC: {ipc} ({tput})"))
 
     def _update_queue_display(self):
         if not self.request_list:
@@ -1149,12 +1145,12 @@ class SimulatorGUI:
         self._draw_fsm()
         self._update_cache_table()
         self._update_signals()
+        self._update_stats()
         self.cache_ctrl.set_write_buffer_stats(
             len(self._write_buffer),
             self._max_wb_occupancy,
             self._cfg_wb_size,
         )
-        self._update_stats()
         self._update_memory_window()
         self._update_dataflow_window()
         self._update_timeline()
@@ -1701,8 +1697,6 @@ class SimulatorGUI:
         out.write(f"  Stall Cycles   : {stats['stall_cycles']}\n")
         out.write(f"  Bus Reads      : {stats['bus_reads']}  (allocations)\n")
         out.write(f"  Bus Writes     : {stats['bus_writes']}  (write-backs)\n")
-        out.write(f"  Write Buffer   : depth={stats['write_buffer_depth']}/{stats['write_buffer_size']}"
-              f"  max={stats['write_buffer_max_occupancy']}\n")
         out.write(f"  Avg Miss Pen.  : {stats['avg_miss_penalty']} cycles\n")
         out.write(f"  AMAT           : {stats['amat']} cycles  "
                   f"(Hit Time + Miss Rate x Miss Penalty)\n")
@@ -1849,9 +1843,6 @@ class SimulatorGUI:
         w.writerow(["Stall Cycles",      stats["stall_cycles"]])
         w.writerow(["Bus Reads",         stats["bus_reads"]])
         w.writerow(["Bus Writes",        stats["bus_writes"]])
-        w.writerow(["Write Buffer Depth", stats["write_buffer_depth"]])
-        w.writerow(["Write Buffer Max Occupancy", stats["write_buffer_max_occupancy"]])
-        w.writerow(["Write Buffer Size",  stats["write_buffer_size"]])
         w.writerow(["Avg Miss Penalty",  stats["avg_miss_penalty"]])
         w.writerow(["AMAT (cycles)",     stats["amat"]])
         w.writerow(["Base CPI",          stats["base_cpi"]])
@@ -1985,7 +1976,6 @@ class SimulatorGUI:
         v_rdlat  = tk.IntVar(value=self._cfg_read_lat)
         v_wrlat  = tk.IntVar(value=self._cfg_write_lat)
         v_base_cpi = tk.DoubleVar(value=self._cfg_base_cpi)
-        v_wb_size = tk.IntVar(value=self._cfg_wb_size)
 
         def lbl(parent, text, fg=DIM):
             return tk.Label(parent, text=text, bg=PANEL_BG, fg=fg,
@@ -2068,15 +2058,6 @@ class SimulatorGUI:
         base_cpi_entry.bind("<KeyRelease>", lambda _e: (sync_base_cpi(), refresh_preview()))
         base_cpi_entry.bind("<FocusOut>", lambda _e: sync_base_cpi())
 
-        lbl(lsect, "Write buffer size").grid(row=4, column=0, sticky=tk.W, **pad)
-        wb_spin = tk.Spinbox(lsect, textvariable=v_wb_size,
-                     from_=1, to=16,
-                     width=5, bg="#45475a", fg=TEXT_COLOR,
-                     font=("Consolas", 9), buttonbackground="#45475a",
-                     command=refresh_preview)
-        wb_spin.bind("<KeyRelease>", lambda _e: refresh_preview())
-        wb_spin.grid(row=4, column=1, sticky=tk.W)
-
         # Section: Live bit-field preview
         prev_frame = tk.Frame(outer, bg=PANEL_BG, padx=10, pady=8)
         prev_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(0, 6))
@@ -2126,8 +2107,6 @@ class SimulatorGUI:
                     errors.append(f"⚠ Lines ({nl}) < current associativity ({assoc}).")
                 if float(v_base_cpi.get()) <= 0:
                     errors.append("⚠ Base CPI must be > 0.")
-                if int(v_wb_size.get()) < 1:
-                    errors.append("⚠ Write buffer size must be >= 1.")
                 warn_lbl.configure(text="\n".join(errors))
                 apply_btn.configure(state=tk.NORMAL if not errors else tk.DISABLED)
             except Exception:
@@ -2157,7 +2136,6 @@ class SimulatorGUI:
                                   int(v_addr.get()),  int(v_rdlat.get()),
                                   int(v_wrlat.get()),
                                   float(v_base_cpi.get()),
-                                  int(v_wb_size.get()),
                               ),
                               bg="#45475a", fg=GREEN,
                               font=("Consolas", 9, "bold"),
@@ -2171,7 +2149,7 @@ class SimulatorGUI:
         dlg.geometry(f"+{mx}+{my}")
 
     def _apply_settings(self, dlg, num_lines, block_size, addr_bits,
-                        read_lat, write_lat, base_cpi, wb_size):
+                        read_lat, write_lat, base_cpi):
         """Validate, store config, close dialog, reset simulation."""
         assoc = self._current_associativity()
 
@@ -2202,12 +2180,6 @@ class SimulatorGUI:
                 "Base CPI must be greater than 0.",
                 parent=dlg)
             return
-        if wb_size < 1:
-            messagebox.showerror(
-                "Invalid Configuration",
-                "Write buffer size must be >= 1.",
-                parent=dlg)
-            return
 
         self._cfg_num_lines  = num_lines
         self._cfg_block_size = block_size
@@ -2215,7 +2187,6 @@ class SimulatorGUI:
         self._cfg_read_lat   = read_lat
         self._cfg_write_lat  = write_lat
         self._cfg_base_cpi   = base_cpi
-        self._cfg_wb_size    = wb_size
 
         dlg.destroy()
         self._reset()
