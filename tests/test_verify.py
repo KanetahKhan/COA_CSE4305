@@ -25,6 +25,16 @@ def check(name, actual, expected):
         failed += 1
 
 
+def check_close(name, actual, expected, tol=1e-9):
+    global passed, failed
+    if abs(actual - expected) <= tol:
+        print(f"  \033[92mPASS\033[0m  {name}")
+        passed += 1
+    else:
+        print(f"  \033[91mFAIL\033[0m  {name}: expected {expected}, got {actual}")
+        failed += 1
+
+
 def test_read_miss_then_hit():
     print("\n[Test 1] Read miss then read hit")
     sim = Simulator(verbose=False)
@@ -142,6 +152,77 @@ def test_write_buffer_dirty_miss_path():
     check("Dirty data persisted", sim.memory.read_word(0x0001), 0xEE)
 
 
+def test_l2_hit_after_l1_eviction():
+    print("\n[Test 10] L2 hit after L1 eviction")
+    sim = Simulator(
+        num_cache_lines=1,
+        mem_read_latency=5,
+        mem_write_latency=4,
+        l2_num_lines=4,
+        l2_latency=1,
+        verbose=False,
+    )
+    sim.init_memory(0x0000, [0x11, 0x22, 0x33, 0x44])
+    sim.init_memory(0x0004, [0xAA, 0xBB, 0xCC, 0xDD])
+
+    result = sim.run([(R, 0x0000, 0), (R, 0x0004, 0), (R, 0x0000, 0)])
+    stats = result["stats"]
+
+    check("Third read served correctly", result["results"][2]["data_returned"], 0x11)
+    check("All three requests miss in L1", stats["l1_misses"], 3)
+    check("L2 records one hit", stats["l2_hits"], 1)
+    check("L2 records two misses", stats["l2_misses"], 2)
+    check("Only two main-memory reads required", stats["main_memory_reads"], 2)
+
+
+def test_l2_writeback_retains_dirty_block():
+    print("\n[Test 11] Dirty block survives in L2")
+    sim = Simulator(
+        num_cache_lines=1,
+        mem_read_latency=5,
+        mem_write_latency=4,
+        l2_num_lines=4,
+        l2_latency=1,
+        verbose=False,
+    )
+    sim.init_memory(0x0000, [0x11, 0x22, 0x33, 0x44])
+    sim.init_memory(0x0004, [0xAA, 0xBB, 0xCC, 0xDD])
+
+    result = sim.run([(W, 0x0001, 0xEE), (R, 0x0004, 0), (R, 0x0001, 0)])
+
+    check("Read after L1 eviction gets dirty value back", result["results"][2]["data_returned"], 0xEE)
+    check("Hierarchy view sees dirty value", sim.memory.read_word(0x0001), 0xEE)
+    check("Backing main memory not updated yet", sim.memory.main_memory.read_word(0x0001), 0x22)
+
+
+def test_local_vs_global_miss_rates():
+    print("\n[Test 12] Local vs global miss rates")
+    sim = Simulator(
+        num_cache_lines=1,
+        mem_read_latency=5,
+        mem_write_latency=4,
+        l2_num_lines=4,
+        l2_latency=1,
+        verbose=False,
+    )
+    sim.init_memory(0x0000, [0x11, 0x22, 0x33, 0x44])
+    sim.init_memory(0x0004, [0xAA, 0xBB, 0xCC, 0xDD])
+
+    result = sim.run([
+        (R, 0x0000, 0),
+        (R, 0x0001, 0),
+        (R, 0x0004, 0),
+        (R, 0x0005, 0),
+        (R, 0x0000, 0),
+    ])
+    stats = result["stats"]
+
+    check_close("L1 local miss rate", stats["l1_local_miss_rate_value"], 3 / 5)
+    check_close("L1 global miss rate", stats["l1_global_miss_rate_value"], 3 / 5)
+    check_close("L2 local miss rate", stats["l2_local_miss_rate_value"], 2 / 3)
+    check_close("L2 global miss rate", stats["l2_global_miss_rate_value"], 2 / 5)
+
+
 if __name__ == "__main__":
     print("\033[1m=== Cache FSM Simulator - Automated Tests ===\033[0m")
 
@@ -154,6 +235,9 @@ if __name__ == "__main__":
     test_address_decomposition()
     test_cpi_impact_calculator()
     test_write_buffer_dirty_miss_path()
+    test_l2_hit_after_l1_eviction()
+    test_l2_writeback_retains_dirty_block()
+    test_local_vs_global_miss_rates()
 
     print(f"\n\033[1mResults: {passed} passed, {failed} failed\033[0m")
     if failed:

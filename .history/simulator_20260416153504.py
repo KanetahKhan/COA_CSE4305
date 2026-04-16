@@ -1,5 +1,5 @@
 from cache_controller import CacheController, State, RequestType, Policy
-from memory import Memory, HierarchicalMemory
+from memory import Memory
 from cpu import CPU
 
 
@@ -36,40 +36,18 @@ class Simulator:
     def __init__(self, num_cache_lines=8, block_size=4, addr_bits=16,
                  mem_read_latency=3, mem_write_latency=2,
                  associativity=1, policy=Policy.DIRECT,
-                 base_cpi=1.0, write_buffer_size=4, verbose=True,
-                 enable_l2=True, l2_num_lines=None, l2_latency=2,
-                 l2_associativity=1, l2_policy=Policy.DIRECT):
+                 base_cpi=1.0, write_buffer_size=4, verbose=True):
         self.cache_ctrl = CacheController(
             num_cache_lines, block_size, addr_bits,
             associativity=associativity, policy=policy,
             base_cpi=base_cpi,
         )
-        self.enable_l2 = bool(enable_l2)
-        self.l2_num_lines = (max(16, num_cache_lines * 2)
-                             if l2_num_lines is None else int(l2_num_lines))
-        self.l2_latency = max(1, int(l2_latency))
-        self.l2_associativity = max(1, int(l2_associativity))
-        self.l2_policy = Policy.DIRECT if self.l2_associativity == 1 else l2_policy
-
-        if self.enable_l2:
-            self.memory = HierarchicalMemory(
-                size=2**addr_bits,
-                block_size=block_size,
-                read_latency=mem_read_latency,
-                write_latency=mem_write_latency,
-                addr_bits=addr_bits,
-                l2_num_lines=self.l2_num_lines,
-                l2_latency=self.l2_latency,
-                l2_associativity=self.l2_associativity,
-                l2_policy=self.l2_policy,
-            )
-        else:
-            self.memory = Memory(
-                size=2**addr_bits,
-                block_size=block_size,
-                read_latency=mem_read_latency,
-                write_latency=mem_write_latency,
-            )
+        self.memory = Memory(
+            size=2**addr_bits,
+            block_size=block_size,
+            read_latency=mem_read_latency,
+            write_latency=mem_write_latency,
+        )
         self.cpu = CPU()
         self.verbose = verbose
         self.max_cycles = 10000
@@ -78,13 +56,6 @@ class Simulator:
         self._max_wb_occupancy = 0
         self._active_wb = None
         self._mem_op_started = False
-        self._sync_hierarchy_stats()
-
-    def _sync_hierarchy_stats(self):
-        if hasattr(self.memory, "get_stats"):
-            self.cache_ctrl.set_hierarchy_stats(self.memory.get_stats())
-        else:
-            self.cache_ctrl.set_hierarchy_stats({})
 
     def init_memory(self, start_addr, values):
         self.memory.init_region(start_addr, values)
@@ -130,7 +101,6 @@ class Simulator:
                 elif completed_write:
                     self._active_wb = None
                 self._mem_op_started = False
-            self._sync_hierarchy_stats()
 
             wb_has_room = len(self.write_buffer) < self.write_buffer_size
             self.cache_ctrl.set_write_buffer_status(wb_has_room)
@@ -153,18 +123,11 @@ class Simulator:
             if prev_state != curr_state:
                 self._mem_op_started = False
 
-            if (curr_state == State.ALLOCATE
+            state_stable = (prev_state == curr_state)
+
+            if (curr_state == State.ALLOCATE and state_stable
                   and not self._mem_op_started and not self.memory.busy):
-                alloc_addr = self.cache_ctrl.mem.address
-                if prev_state != curr_state:
-                    tag, _, _ = self.cache_ctrl._decompose_address(
-                        self.cache_ctrl.saved_address
-                    )
-                    alloc_addr = self.cache_ctrl._block_address(
-                        tag,
-                        self.cache_ctrl.saved_set,
-                    )
-                self.memory.start_read(alloc_addr)
+                self.memory.start_read(self.cache_ctrl.mem.address)
                 self._mem_op_started = True
 
             elif (not self.memory.busy and self.write_buffer):
@@ -185,7 +148,6 @@ class Simulator:
             self._max_wb_occupancy,
             self.write_buffer_size,
         )
-        self._sync_hierarchy_stats()
 
         if self.verbose:
             self._print_separator()
@@ -198,7 +160,6 @@ class Simulator:
             "results": self.cpu.results,
             "log":     self.cache_ctrl.log,
             "cache":   self.cache_ctrl.get_cache_snapshot(),
-            "l2_cache": self.memory.get_cache_snapshot() if hasattr(self.memory, "get_cache_snapshot") else [],
         }
 
     def _drain_write_buffer_background(self):
@@ -209,14 +170,12 @@ class Simulator:
                                         self._active_wb["data"])
 
             self.memory.tick()
-            self._sync_hierarchy_stats()
             if self.memory.ready and self.memory.operation == "write":
                 self.cache_ctrl.notify_writeback_completed(
                     self.memory.address,
                     list(self.memory.buffer),
                 )
                 self._active_wb = None
-        self._sync_hierarchy_stats()
 
     def _print_header(self, label):
         width = 96
@@ -232,8 +191,6 @@ class Simulator:
         assoc_str = (f"{ctrl.associativity}-way Set-Associative"
                      if ctrl.associativity > 1 else "Direct-Mapped")
         policy_str = ctrl.policy.value
-        main_mem = self.memory.main_memory if hasattr(self.memory, "main_memory") else self.memory
-        stats = self.cache_ctrl.get_stats()
 
         print(f"\n  {colorize('Configuration:', 'BOLD')}")
         print(f"    Cache Lines : {ctrl.num_lines}    "
@@ -245,18 +202,8 @@ class Simulator:
         print(f"    Tag Bits    : {ctrl.tag_bits}    "
               f"Index Bits : {ctrl.index_bits}        "
               f"Offset Bits  : {ctrl.offset_bits}")
-        if stats.get("l2_enabled"):
-            l2_assoc = stats.get("l2_associativity", 1)
-            l2_assoc_str = (f"{l2_assoc}-way Set-Associative"
-                            if l2_assoc > 1 else "Direct-Mapped")
-            print(f"    L2 Cache     : {stats.get('l2_num_lines', 0)} lines    "
-                  f"Latency : {stats.get('l2_latency', 0)} cycles    "
-                  f"Assoc : {l2_assoc_str}")
-            print(f"    L2 Policy    : {stats.get('l2_policy', 'Direct-Mapped')}")
-        else:
-            print(f"    L2 Cache     : Disabled")
-        print(f"    Main Mem Read Latency  : {main_mem.read_latency} cycles")
-        print(f"    Main Mem Write Latency : {main_mem.write_latency} cycles")
+        print(f"    Memory Read Latency  : {self.memory.read_latency} cycles")
+        print(f"    Memory Write Latency : {self.memory.write_latency} cycles")
         print(f"    Write Policy: Write-Back, Write-Allocate")
         self._print_separator()
         print(f"  {'Cycle':>5}  {'State Transition':^32}  "
@@ -349,36 +296,25 @@ class Simulator:
         stats = self.cache_ctrl.get_stats()
         print(f"\n  {colorize('Performance Statistics:', 'BOLD')}")
         print(f"    Total Requests : {stats['total_requests']}")
-        print(f"    L1 Hits        : {colorize(str(stats['hits']), 'GREEN')}")
-        print(f"    L1 Misses      : {colorize(str(stats['misses']), 'RED')}"
+        print(f"    Cache Hits     : {colorize(str(stats['hits']), 'GREEN')}")
+        print(f"    Cache Misses   : {colorize(str(stats['misses']), 'RED')}"
               f"  (compulsory: {stats['compulsory_misses']}"
               f"  conflict: {stats['conflict_misses']})")
-        print(f"    L1 Hit Rate    : {colorize(stats['hit_rate'], 'CYAN')}")
-        print(f"    L1 Miss Rate   : local={stats['l1_local_miss_rate']}  "
-              f"global={stats['l1_global_miss_rate']}")
-        if stats.get("l2_enabled"):
-            print(f"    L2 Accesses    : {stats['l2_accesses']}")
-            print(f"    L2 Hits/Misses : {stats['l2_hits']} / {stats['l2_misses']}")
-            print(f"    L2 Miss Rate   : local={stats['l2_local_miss_rate']}  "
-                  f"global={stats['l2_global_miss_rate']}")
+        print(f"    Hit Rate       : {colorize(stats['hit_rate'], 'CYAN')}")
         print(f"    Total Cycles   : {stats['total_cycles']}")
         print(f"    Stall Cycles   : {stats['stall_cycles']}")
-        print(f"    L1 Bus Reads   : {stats['bus_reads']}  (allocations)")
-        print(f"    L1 Bus Writes  : {stats['bus_writes']}  (write-backs)")
-        if stats.get("l2_enabled"):
-            print(f"    Main Mem Reads : {stats.get('main_memory_reads', 0)}")
-            print(f"    Main Mem Writes: {stats.get('main_memory_writes', 0)}"
-                  f"  (dirty L2 evictions: {stats.get('l2_dirty_evictions', 0)})")
-        print(f"    Write Buffer   : depth={stats['write_buffer_depth']}/"
+        print(f"    Bus Reads      : {stats['bus_reads']}  (allocations)")
+        print(f"    Bus Writes     : {stats['bus_writes']}  (write-backs)")
+          print(f"    Write Buffer   : depth={stats['write_buffer_depth']}/"
               f"{stats['write_buffer_size']}  max={stats['write_buffer_max_occupancy']}")
         print(f"    Avg Miss Pen.  : {colorize(str(stats['avg_miss_penalty']), 'YELLOW')} cycles")
         print(f"    AMAT           : {colorize(str(stats['amat']), 'CYAN')} cycles")
-        print(f"    Base CPI       : {stats['base_cpi']}")
-        print(f"    Instructions   : {stats['instructions']}")
-        print(f"    Memory Stalls  : {stats['memory_stalls']}")
-        print(f"    Effective CPI  : {colorize(str(stats['effective_cpi']), 'MAGENTA')}"
+          print(f"    Base CPI       : {stats['base_cpi']}")
+          print(f"    Instructions   : {stats['instructions']}")
+          print(f"    Memory Stalls  : {stats['memory_stalls']}")
+          print(f"    Effective CPI  : {colorize(str(stats['effective_cpi']), 'MAGENTA')}"
               f"  (= Base CPI + Memory Stalls / Instructions)")
-        print(f"    Throughput IPC : {colorize(str(stats['achieved_ipc']), 'GREEN')}"
+          print(f"    Throughput IPC : {colorize(str(stats['achieved_ipc']), 'GREEN')}"
               f"  (ideal: {stats['ideal_ipc']}, "
               f"{stats['throughput_ratio'] * 100:.1f}% of ideal)")
 

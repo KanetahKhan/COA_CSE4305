@@ -626,6 +626,22 @@ class CompareWindow(tk.Toplevel):
              _w(res_a["allocations"], res_b["allocations"], False)),
         ]
 
+        if sa.get("l2_enabled") or sb.get("l2_enabled"):
+            rows.extend([
+                ("L2 Hits",        str(sa.get("l2_hits", 0)), str(sb.get("l2_hits", 0)),
+                 _w(sa.get("l2_hits", 0), sb.get("l2_hits", 0), True)),
+                ("L2 Misses",      str(sa.get("l2_misses", 0)), str(sb.get("l2_misses", 0)),
+                 _w(sa.get("l2_misses", 0), sb.get("l2_misses", 0), False)),
+                ("L2 Local Miss",  str(sa.get("l2_local_miss_rate", "N/A")),
+                                   str(sb.get("l2_local_miss_rate", "N/A")),
+                 _w(sa.get("l2_local_miss_rate_value", 0),
+                    sb.get("l2_local_miss_rate_value", 0), False)),
+                ("L2 Global Miss", str(sa.get("l2_global_miss_rate", "N/A")),
+                                   str(sb.get("l2_global_miss_rate", "N/A")),
+                 _w(sa.get("l2_global_miss_rate_value", 0),
+                    sb.get("l2_global_miss_rate_value", 0), False)),
+            ])
+
         for metric, va, vb, (tag, sym) in rows:
             self._stats_tree.insert("", tk.END,
                                     values=(metric, va, vb, sym),

@@ -25,7 +25,7 @@ import csv
 import io
 import datetime
 from cache_controller import CacheController, State, RequestType, Policy
-from memory import Memory
+from memory import Memory, HierarchicalMemory
 from cpu import CPU
 from compare_window import CompareWindow
 from memory_window import MemoryWindow
@@ -86,6 +86,9 @@ class SimulatorGUI:
         self._cfg_addr_bits  = 16
         self._cfg_read_lat   = 3
         self._cfg_write_lat  = 2
+        self._cfg_enable_l2  = True
+        self._cfg_l2_lines   = 16
+        self._cfg_l2_latency = 2
         self._cfg_base_cpi   = 1.0
         self._cfg_wb_size    = 4
 
@@ -231,17 +234,35 @@ class SimulatorGUI:
             base_cpi=self._cfg_base_cpi,
         )
         self.cache_ctrl.set_write_buffer_stats(0, 0, self._cfg_wb_size)
-        self.memory          = Memory(
-            size=2 ** self._cfg_addr_bits,
-            block_size=self._cfg_block_size,
-            read_latency=self._cfg_read_lat,
-            write_latency=self._cfg_write_lat,
-        )
+        if self._cfg_enable_l2:
+            self.memory = HierarchicalMemory(
+                size=2 ** self._cfg_addr_bits,
+                block_size=self._cfg_block_size,
+                read_latency=self._cfg_read_lat,
+                write_latency=self._cfg_write_lat,
+                addr_bits=self._cfg_addr_bits,
+                l2_num_lines=self._cfg_l2_lines,
+                l2_latency=self._cfg_l2_latency,
+            )
+        else:
+            self.memory = Memory(
+                size=2 ** self._cfg_addr_bits,
+                block_size=self._cfg_block_size,
+                read_latency=self._cfg_read_lat,
+                write_latency=self._cfg_write_lat,
+            )
         self.cpu             = CPU()
         self._mem_op_started = False
         self.cycle           = 0
         self._write_buffer   = []
         self._max_wb_occupancy = 0
+        self._sync_hierarchy_stats()
+
+    def _sync_hierarchy_stats(self):
+        if hasattr(self.memory, "get_stats"):
+            self.cache_ctrl.set_hierarchy_stats(self.memory.get_stats())
+        else:
+            self.cache_ctrl.set_hierarchy_stats({})
 
     def _init_memory_data(self):
         bs = self._cfg_block_size
@@ -428,7 +449,7 @@ class SimulatorGUI:
         self.cycle_label.pack(side=tk.LEFT, padx=(0, 16))
 
         self.stats_label = tk.Label(row1,
-                                    text="Hits: 0  ·  Misses: 0  ·  Rate: —",
+                                    text="L1 H/M: 0/0  ·  Rate: —",
                                     bg=PANEL_BG, fg=SUBTEXT,
                                     font=("Consolas", 9))
         self.stats_label.pack(side=tk.LEFT)
@@ -565,15 +586,17 @@ class SimulatorGUI:
         nl    = self._cfg_num_lines
         bs    = self._cfg_block_size
         ab    = self._cfg_addr_bits
+        l2_str = (f"L2={self._cfg_l2_lines} lines @ {self._cfg_l2_latency}cy"
+                  if self._cfg_enable_l2 else "L2=off")
         if assoc == 1:
             return (f"Config: Direct-Mapped  |  {nl} lines  |  "
                 f"block={bs}  |  {ab}-bit addr  |  Base CPI={self._cfg_base_cpi:.2f}"
-                f"  |  WB={self._cfg_wb_size}")
+                f"  |  {l2_str}  |  WB={self._cfg_wb_size}")
         pol  = self.policy_var.get()
         sets = nl // assoc
         return (f"Config: {assoc}-way Set-Assoc  |  {sets} sets × {assoc} ways  |  "
             f"Policy: {pol}  |  block={bs}  |  {ab}-bit addr  |  Base CPI={self._cfg_base_cpi:.2f}"
-            f"  |  WB={self._cfg_wb_size}")
+            f"  |  {l2_str}  |  WB={self._cfg_wb_size}")
 
     def _build_cache_panel(self, parent):
         frame = parent  # parent is already a styled Frame from _build_ui
@@ -981,9 +1004,15 @@ class SimulatorGUI:
         tput = f"{stats['throughput_ratio'] * 100:.1f}%" if stats["total_requests"] else "—"
         comp  = stats["compulsory_misses"]
         conf  = stats["conflict_misses"]
+        hierarchy = ""
+        if stats.get("l2_enabled"):
+            hierarchy = (f"  |  L1 miss: {stats['l1_local_miss_rate']}  |  "
+                         f"L2 H/M: {stats['l2_hits']}/{stats['l2_misses']} "
+                         f"(local:{stats['l2_local_miss_rate']} "
+                         f"global:{stats['l2_global_miss_rate']})")
         self.stats_label.configure(
-            text=(f"Hits: {stats['hits']}  ·  Misses: {stats['misses']} "
-                  f"(cold:{comp} repl:{conf})  ·  Rate: {rate}  ·  "
+            text=(f"L1 H/M: {stats['hits']}/{stats['misses']} "
+                  f"(cold:{comp} repl:{conf})  ·  Rate: {rate}{hierarchy}  ·  "
                   f"AMAT: {amat}  ·  Stalls: {stats['stall_cycles']}  ·  "
                   f"Eff CPI: {eff_cpi}  ·  IPC: {ipc} ({tput})  ·  "
                   f"WB: {stats['write_buffer_depth']}/{stats['write_buffer_size']}"))
@@ -1057,6 +1086,7 @@ class SimulatorGUI:
             self.cache_ctrl.clear_request()
 
         self.memory.tick()
+        self._sync_hierarchy_stats()
 
         completed_write = (self.memory.ready and self.memory.operation == "write")
         completed_write_addr = self.memory.address
@@ -1092,7 +1122,16 @@ class SimulatorGUI:
 
         if (curr_state == State.ALLOCATE
               and not self._mem_op_started and not self.memory.busy):
-            self.memory.start_read(self.cache_ctrl.mem.address)
+            alloc_addr = self.cache_ctrl.mem.address
+            if prev_state != curr_state:
+                tag, _, _ = self.cache_ctrl._decompose_address(
+                    self.cache_ctrl.saved_address
+                )
+                alloc_addr = self.cache_ctrl._block_address(
+                    tag,
+                    self.cache_ctrl.saved_set,
+                )
+            self.memory.start_read(alloc_addr)
             self._mem_op_started = True
         elif (not self.memory.busy and self._write_buffer):
             wb = self._write_buffer.pop(0)
@@ -1154,6 +1193,7 @@ class SimulatorGUI:
             self._max_wb_occupancy,
             self._cfg_wb_size,
         )
+        self._sync_hierarchy_stats()
         self._update_stats()
         self._update_memory_window()
         self._update_dataflow_window()
@@ -1685,6 +1725,12 @@ class SimulatorGUI:
                   f"Index Bits : {ctrl.index_bits}   "
                   f"Offset Bits : {ctrl.offset_bits}\n")
         out.write(f"  Write Policy  : Write-Back, Write-Allocate\n")
+        if stats.get("l2_enabled"):
+            out.write(f"  L2 Cache      : {stats.get('l2_num_lines', 0)} lines, "
+                      f"{stats.get('l2_policy', 'Direct-Mapped')}, "
+                      f"{stats.get('l2_latency', 0)} cycle hit latency\n")
+        else:
+            out.write("  L2 Cache      : Disabled\n")
 
         # ── statistics ────────────────────────────────────────────────
         out.write(section("PERFORMANCE STATISTICS"))
@@ -1692,15 +1738,27 @@ class SimulatorGUI:
         misses = stats['misses']
         hits   = stats['hits']
         total  = stats['total_requests'] or 1
-        out.write(f"  Cache Hits     : {hits}  ({hits/total*100:.1f}%)\n")
-        out.write(f"  Cache Misses   : {misses}  ({misses/total*100:.1f}%)\n")
+        out.write(f"  L1 Hits        : {hits}  ({hits/total*100:.1f}%)\n")
+        out.write(f"  L1 Misses      : {misses}  ({misses/total*100:.1f}%)\n")
         out.write(f"    Compulsory   : {stats['compulsory_misses']}\n")
         out.write(f"    Conflict     : {stats['conflict_misses']}\n")
-        out.write(f"  Hit Rate       : {stats['hit_rate']}\n")
+        out.write(f"  L1 Hit Rate    : {stats['hit_rate']}\n")
+        out.write(f"  L1 Miss Rate   : local={stats['l1_local_miss_rate']}  "
+                  f"global={stats['l1_global_miss_rate']}\n")
+        if stats.get("l2_enabled"):
+            out.write(f"  L2 Accesses    : {stats['l2_accesses']}\n")
+            out.write(f"  L2 Hits        : {stats['l2_hits']}\n")
+            out.write(f"  L2 Misses      : {stats['l2_misses']}\n")
+            out.write(f"  L2 Miss Rate   : local={stats['l2_local_miss_rate']}  "
+                      f"global={stats['l2_global_miss_rate']}\n")
         out.write(f"  Total Cycles   : {stats['total_cycles']}\n")
         out.write(f"  Stall Cycles   : {stats['stall_cycles']}\n")
-        out.write(f"  Bus Reads      : {stats['bus_reads']}  (allocations)\n")
-        out.write(f"  Bus Writes     : {stats['bus_writes']}  (write-backs)\n")
+        out.write(f"  L1 Bus Reads   : {stats['bus_reads']}  (allocations)\n")
+        out.write(f"  L1 Bus Writes  : {stats['bus_writes']}  (write-backs)\n")
+        if stats.get("l2_enabled"):
+            out.write(f"  Main Mem Reads : {stats.get('main_memory_reads', 0)}\n")
+            out.write(f"  Main Mem Writes: {stats.get('main_memory_writes', 0)}"
+                      f"  (dirty L2 evictions: {stats.get('l2_dirty_evictions', 0)})\n")
         out.write(f"  Write Buffer   : depth={stats['write_buffer_depth']}/{stats['write_buffer_size']}"
               f"  max={stats['write_buffer_max_occupancy']}\n")
         out.write(f"  Avg Miss Pen.  : {stats['avg_miss_penalty']} cycles\n")
@@ -1835,20 +1893,37 @@ class SimulatorGUI:
         w.writerow(["Index Bits",    ctrl.index_bits])
         w.writerow(["Offset Bits",   ctrl.offset_bits])
         w.writerow(["Write Policy",  "Write-Back Write-Allocate"])
+        w.writerow(["L2 Enabled",    "Yes" if stats.get("l2_enabled") else "No"])
+        if stats.get("l2_enabled"):
+            w.writerow(["L2 Lines",      stats.get("l2_num_lines", 0)])
+            w.writerow(["L2 Policy",     stats.get("l2_policy", "Direct-Mapped")])
+            w.writerow(["L2 Latency",    stats.get("l2_latency", 0)])
 
         # ── statistics ────────────────────────────────────────────────
         heading("Performance Statistics")
         w.writerow(["Metric", "Value"])
         w.writerow(["Total Requests",    stats["total_requests"]])
-        w.writerow(["Cache Hits",        stats["hits"]])
-        w.writerow(["Cache Misses",      stats["misses"]])
+        w.writerow(["L1 Hits",           stats["hits"]])
+        w.writerow(["L1 Misses",         stats["misses"]])
         w.writerow(["Compulsory Misses", stats["compulsory_misses"]])
         w.writerow(["Conflict Misses",   stats["conflict_misses"]])
-        w.writerow(["Hit Rate",          stats["hit_rate"]])
+        w.writerow(["L1 Hit Rate",       stats["hit_rate"]])
+        w.writerow(["L1 Local Miss Rate", stats["l1_local_miss_rate"]])
+        w.writerow(["L1 Global Miss Rate", stats["l1_global_miss_rate"]])
+        if stats.get("l2_enabled"):
+            w.writerow(["L2 Accesses",       stats["l2_accesses"]])
+            w.writerow(["L2 Hits",           stats["l2_hits"]])
+            w.writerow(["L2 Misses",         stats["l2_misses"]])
+            w.writerow(["L2 Local Miss Rate", stats["l2_local_miss_rate"]])
+            w.writerow(["L2 Global Miss Rate", stats["l2_global_miss_rate"]])
         w.writerow(["Total Cycles",      stats["total_cycles"]])
         w.writerow(["Stall Cycles",      stats["stall_cycles"]])
-        w.writerow(["Bus Reads",         stats["bus_reads"]])
-        w.writerow(["Bus Writes",        stats["bus_writes"]])
+        w.writerow(["L1 Bus Reads",      stats["bus_reads"]])
+        w.writerow(["L1 Bus Writes",     stats["bus_writes"]])
+        if stats.get("l2_enabled"):
+            w.writerow(["Main Memory Reads",  stats.get("main_memory_reads", 0)])
+            w.writerow(["Main Memory Writes", stats.get("main_memory_writes", 0)])
+            w.writerow(["Dirty L2 Evictions", stats.get("l2_dirty_evictions", 0)])
         w.writerow(["Write Buffer Depth", stats["write_buffer_depth"]])
         w.writerow(["Write Buffer Max Occupancy", stats["write_buffer_max_occupancy"]])
         w.writerow(["Write Buffer Size",  stats["write_buffer_size"]])
@@ -1984,6 +2059,9 @@ class SimulatorGUI:
         v_addr   = tk.IntVar(value=self._cfg_addr_bits)
         v_rdlat  = tk.IntVar(value=self._cfg_read_lat)
         v_wrlat  = tk.IntVar(value=self._cfg_write_lat)
+        v_enable_l2 = tk.BooleanVar(value=self._cfg_enable_l2)
+        v_l2_lines = tk.IntVar(value=self._cfg_l2_lines)
+        v_l2_lat = tk.IntVar(value=self._cfg_l2_latency)
         v_base_cpi = tk.DoubleVar(value=self._cfg_base_cpi)
         v_wb_size = tk.IntVar(value=self._cfg_wb_size)
 
@@ -2077,9 +2155,32 @@ class SimulatorGUI:
         wb_spin.bind("<KeyRelease>", lambda _e: refresh_preview())
         wb_spin.grid(row=4, column=1, sticky=tk.W)
 
+        # Section: L2 cache
+        hsect = tk.Frame(outer, bg=PANEL_BG, padx=10, pady=8)
+        hsect.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+
+        tk.Label(hsect, text="L2 Hierarchy", bg=PANEL_BG, fg=ACCENT,
+                 font=("Consolas", 10, "bold")).grid(
+                     row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 6))
+
+        l2_chk = tk.Checkbutton(
+            hsect, text="Enable L2 cache", variable=v_enable_l2,
+            bg=PANEL_BG, fg=TEXT_COLOR, selectcolor=PANEL_BG,
+            font=("Consolas", 9), activebackground=PANEL_BG,
+            command=refresh_preview,
+        )
+        l2_chk.grid(row=1, column=0, columnspan=2, sticky=tk.W, padx=12, pady=4)
+
+        lbl(hsect, "L2 lines").grid(row=2, column=0, sticky=tk.W, **pad)
+        combo(hsect, v_l2_lines, LINE_OPTS, width=6).grid(row=2, column=1, sticky=tk.W)
+        lbl(hsect, "(power of 2)").grid(row=2, column=2, sticky=tk.W, padx=(4, 0))
+
+        lbl(hsect, "L2 latency (cycles)").grid(row=3, column=0, sticky=tk.W, **pad)
+        spinbox(hsect, v_l2_lat).grid(row=3, column=1, sticky=tk.W)
+
         # Section: Live bit-field preview
         prev_frame = tk.Frame(outer, bg=PANEL_BG, padx=10, pady=8)
-        prev_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+        prev_frame.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(0, 6))
 
         tk.Label(prev_frame, text="Address Bit-Field Preview", bg=PANEL_BG, fg=ACCENT,
                  font=("Consolas", 10, "bold")).pack(anchor=tk.W, pady=(0, 4))
@@ -2117,6 +2218,13 @@ class SimulatorGUI:
                     f"  Offset bits    : {ob}  [bits {ob-1}:0]",
                     f"  Cache size     : {nl * bs} words  ({nl} lines × {bs} words)",
                 ]
+                if bool(v_enable_l2.get()):
+                    lines.append(
+                        f"  L2 hierarchy   : ON  ({int(v_l2_lines.get())} lines, "
+                        f"{int(v_l2_lat.get())} cycle hit latency)"
+                    )
+                else:
+                    lines.append("  L2 hierarchy   : OFF")
                 preview_lbl.configure(text="\n".join(lines))
 
                 errors = []
@@ -2128,6 +2236,8 @@ class SimulatorGUI:
                     errors.append("⚠ Base CPI must be > 0.")
                 if int(v_wb_size.get()) < 1:
                     errors.append("⚠ Write buffer size must be >= 1.")
+                if bool(v_enable_l2.get()) and int(v_l2_lines.get()) < 1:
+                    errors.append("âš  L2 lines must be >= 1.")
                 warn_lbl.configure(text="\n".join(errors))
                 apply_btn.configure(state=tk.NORMAL if not errors else tk.DISABLED)
             except Exception:
@@ -2137,7 +2247,7 @@ class SimulatorGUI:
 
         # ── buttons ────────────────────────────────────────────────────
         btn_row = tk.Frame(outer, bg=BG_COLOR)
-        btn_row.grid(row=4, column=0, columnspan=3, pady=(6, 0), sticky="e")
+        btn_row.grid(row=5, column=0, columnspan=3, pady=(6, 0), sticky="e")
 
         tk.Label(btn_row,
                  text="⚠ Applying will reset the simulation.",
@@ -2156,6 +2266,9 @@ class SimulatorGUI:
                                   int(v_lines.get()), int(v_block.get()),
                                   int(v_addr.get()),  int(v_rdlat.get()),
                                   int(v_wrlat.get()),
+                                  bool(v_enable_l2.get()),
+                                  int(v_l2_lines.get()),
+                                  int(v_l2_lat.get()),
                                   float(v_base_cpi.get()),
                                   int(v_wb_size.get()),
                               ),
@@ -2171,7 +2284,8 @@ class SimulatorGUI:
         dlg.geometry(f"+{mx}+{my}")
 
     def _apply_settings(self, dlg, num_lines, block_size, addr_bits,
-                        read_lat, write_lat, base_cpi, wb_size):
+                        read_lat, write_lat, enable_l2, l2_lines, l2_latency,
+                        base_cpi, wb_size):
         """Validate, store config, close dialog, reset simulation."""
         assoc = self._current_associativity()
 
@@ -2208,12 +2322,21 @@ class SimulatorGUI:
                 "Write buffer size must be >= 1.",
                 parent=dlg)
             return
+        if enable_l2 and l2_lines < 1:
+            messagebox.showerror(
+                "Invalid Configuration",
+                "L2 lines must be >= 1.",
+                parent=dlg)
+            return
 
         self._cfg_num_lines  = num_lines
         self._cfg_block_size = block_size
         self._cfg_addr_bits  = addr_bits
         self._cfg_read_lat   = read_lat
         self._cfg_write_lat  = write_lat
+        self._cfg_enable_l2  = enable_l2
+        self._cfg_l2_lines   = l2_lines
+        self._cfg_l2_latency = l2_latency
         self._cfg_base_cpi   = base_cpi
         self._cfg_wb_size    = wb_size
 

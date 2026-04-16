@@ -115,6 +115,7 @@ class CacheController:
         self.write_buffer_depth = 0
         self.write_buffer_max_occupancy = 0
         self.write_buffer_size = 0
+        self._hierarchy_stats = {}
 
         self.log = []
 
@@ -232,6 +233,9 @@ class CacheController:
         self.write_buffer_depth = int(depth)
         self.write_buffer_max_occupancy = int(max_occupancy)
         self.write_buffer_size = int(size)
+
+    def set_hierarchy_stats(self, stats):
+        self._hierarchy_stats = dict(stats or {})
 
     # ------------------------------------------------------------------
     # FSM tick
@@ -450,7 +454,8 @@ class CacheController:
         return snapshot
 
     def get_stats(self):
-        total  = self.total_requests or 1
+        total_requests = self.total_requests
+        total = total_requests or 1
         miss_r = self.misses / total
         hit_r  = self.hits / total
         avg_miss_penalty = (self.total_miss_penalty / self.misses
@@ -469,8 +474,22 @@ class CacheController:
         achieved_ipc = (1.0 / effective_cpi) if effective_cpi > 0 else 0
         throughput_ratio = (achieved_ipc / ideal_ipc) if ideal_ipc > 0 else 0
         throughput_loss_pct = (1.0 - throughput_ratio) * 100 if ideal_ipc > 0 else 0
+        hier = self._hierarchy_stats or {}
+        l2_enabled = bool(hier.get("l2_enabled", False))
+        l1_local_miss_rate = (self.misses / total_requests) if total_requests else 0
+        l1_global_miss_rate = l1_local_miss_rate
 
-        return {
+        l2_accesses = int(hier.get("l2_accesses", 0))
+        l2_hits = int(hier.get("l2_hits", 0))
+        l2_misses = int(hier.get("l2_misses", 0))
+        l2_hit_rate_value = (l2_hits / l2_accesses) if l2_accesses else 0
+        l2_local_miss_rate_value = (l2_misses / l2_accesses) if l2_accesses else 0
+        l2_global_miss_rate_value = (l2_misses / total_requests) if total_requests else 0
+
+        def _pct(value, valid):
+            return f"{value * 100:.1f}%" if valid else "N/A"
+
+        stats = {
             "total_requests":    self.total_requests,
             "hits":              self.hits,
             "misses":            self.misses,
@@ -496,4 +515,25 @@ class CacheController:
             "write_buffer_depth": self.write_buffer_depth,
             "write_buffer_max_occupancy": self.write_buffer_max_occupancy,
             "write_buffer_size": self.write_buffer_size,
+            "l1_hits":           self.hits,
+            "l1_misses":         self.misses,
+            "l1_hit_rate":       f"{hit_r * 100:.1f}%"
+                                 if self.total_requests else "N/A",
+            "l1_hit_rate_value": hit_r if self.total_requests else 0,
+            "l1_local_miss_rate": _pct(l1_local_miss_rate, self.total_requests > 0),
+            "l1_local_miss_rate_value": l1_local_miss_rate,
+            "l1_global_miss_rate": _pct(l1_global_miss_rate, self.total_requests > 0),
+            "l1_global_miss_rate_value": l1_global_miss_rate,
+            "l2_enabled":        l2_enabled,
+            "l2_accesses":       l2_accesses,
+            "l2_hits":           l2_hits,
+            "l2_misses":         l2_misses,
+            "l2_hit_rate":       _pct(l2_hit_rate_value, l2_accesses > 0),
+            "l2_hit_rate_value": l2_hit_rate_value,
+            "l2_local_miss_rate": _pct(l2_local_miss_rate_value, l2_accesses > 0),
+            "l2_local_miss_rate_value": l2_local_miss_rate_value,
+            "l2_global_miss_rate": _pct(l2_global_miss_rate_value, self.total_requests > 0),
+            "l2_global_miss_rate_value": l2_global_miss_rate_value,
         }
+        stats.update(hier)
+        return stats
