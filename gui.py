@@ -148,6 +148,45 @@ class SimulatorGUI:
                 (RequestType.WRITE, 0x0000, 0xAA),
                 (RequestType.READ,  0x0100, 0),
             ],
+            "Spatial Locality": [
+                # Sequential access within a block — first miss, then all hits
+                (RequestType.READ,  0x0000, 0),
+                (RequestType.READ,  0x0001, 0),
+                (RequestType.READ,  0x0002, 0),
+                (RequestType.READ,  0x0003, 0),
+                # Next block — one miss, then hits
+                (RequestType.READ,  0x0004, 0),
+                (RequestType.READ,  0x0005, 0),
+                (RequestType.READ,  0x0006, 0),
+                (RequestType.READ,  0x0007, 0),
+            ],
+            "Temporal Locality": [
+                # Same address accessed repeatedly — first miss, then all hits
+                (RequestType.READ,  0x0100, 0),
+                (RequestType.READ,  0x0100, 0),
+                (RequestType.READ,  0x0100, 0),
+                (RequestType.WRITE, 0x0100, 0xBB),
+                (RequestType.READ,  0x0100, 0),
+                (RequestType.READ,  0x0100, 0),
+            ],
+            "Thrashing (Conflict)": [
+                # Two addresses map to the same set — every access is a miss
+                (RequestType.READ,  0x0000, 0),
+                (RequestType.READ,  0x0100, 0),
+                (RequestType.READ,  0x0000, 0),
+                (RequestType.READ,  0x0100, 0),
+                (RequestType.READ,  0x0000, 0),
+                (RequestType.READ,  0x0100, 0),
+            ],
+            "Compulsory Only": [
+                # Each address is unique — every miss is compulsory
+                (RequestType.READ,  0x0000, 0),
+                (RequestType.READ,  0x0100, 0),
+                (RequestType.READ,  0x0200, 0),
+                (RequestType.READ,  0x0300, 0),
+                (RequestType.READ,  0x0400, 0),
+                (RequestType.READ,  0x0500, 0),
+            ],
         }
 
         self._build_ui()
@@ -422,7 +461,10 @@ class SimulatorGUI:
             CYAN,   "#122030", "#1a3040").pack(side=tk.LEFT, padx=(0, 3))
 
         btn(row2, "📄 Export", self._export_report,
-            TEAL,   "#122820", "#1a3c2c").pack(side=tk.LEFT, padx=(0, 10))
+            TEAL,   "#122820", "#1a3c2c").pack(side=tk.LEFT, padx=(0, 3))
+
+        btn(row2, "📥 Import", self._import_trace,
+            YELLOW, "#2c2514", "#3c3520").pack(side=tk.LEFT, padx=(0, 10))
 
         tk.Label(row2, text="Speed:", bg=PANEL_BG, fg=DIM,
                  font=("Consolas", 8)).pack(side=tk.LEFT)
@@ -916,8 +958,13 @@ class SimulatorGUI:
         stats = self.cache_ctrl.get_stats()
         self.cycle_label.configure(text=f"Cycle: {self.cycle}")
         rate  = stats["hit_rate"] if stats["total_requests"] else "—"
+        amat  = f"{stats['amat']:.2f}" if stats["total_requests"] else "—"
+        comp  = stats["compulsory_misses"]
+        conf  = stats["conflict_misses"]
         self.stats_label.configure(
-            text=f"Hits: {stats['hits']}  ·  Misses: {stats['misses']}  ·  Rate: {rate}")
+            text=(f"Hits: {stats['hits']}  ·  Misses: {stats['misses']} "
+                  f"(cold:{comp} repl:{conf})  ·  Rate: {rate}  ·  "
+                  f"AMAT: {amat}  ·  Stalls: {stats['stall_cycles']}"))
 
     def _update_queue_display(self):
         if not self.request_list:
@@ -1441,6 +1488,79 @@ class SimulatorGUI:
         win.bind("<Enter>", lambda _e: None)   # don't steal events
 
     # ------------------------------------------------------------------
+    # Import address trace from file
+    # ------------------------------------------------------------------
+
+    def _import_trace(self):
+        """Load an address trace file (.txt or .csv).
+
+        Supported formats (one request per line):
+          R 0x0100          — read hex address
+          W 0x0200 0xFF     — write hex address with data
+          READ 0x0100       — same, using full keyword
+          WRITE 0x0200 FF   — 0x prefix on data is optional
+          0x0100            — bare address treated as READ
+        Lines starting with # are comments. Blank lines are skipped.
+        """
+        path = filedialog.askopenfilename(
+            title="Import Address Trace",
+            filetypes=[
+                ("Text files", "*.txt"),
+                ("CSV files",  "*.csv"),
+                ("All files",  "*.*"),
+            ],
+        )
+        if not path:
+            return
+
+        try:
+            requests = []
+            with open(path, "r", encoding="utf-8") as fh:
+                for _, raw_line in enumerate(fh, 1):
+                    line = raw_line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+
+                    parts = line.replace(",", " ").split()
+                    if not parts:
+                        continue
+
+                    # Determine type and address
+                    first = parts[0].upper()
+                    if first in ("R", "READ"):
+                        rt = RequestType.READ
+                        addr_str = parts[1] if len(parts) > 1 else "0"
+                        data_str = parts[2] if len(parts) > 2 else "0"
+                    elif first in ("W", "WRITE"):
+                        rt = RequestType.WRITE
+                        addr_str = parts[1] if len(parts) > 1 else "0"
+                        data_str = parts[2] if len(parts) > 2 else "0"
+                    else:
+                        # Bare address — treat as READ
+                        rt = RequestType.READ
+                        addr_str = first
+                        data_str = "0"
+
+                    addr = int(addr_str, 16) if addr_str.startswith("0x") or addr_str.startswith("0X") else int(addr_str, 16)
+                    data = int(data_str, 16) if data_str.startswith("0x") or data_str.startswith("0X") else int(data_str, 16)
+                    requests.append((rt, addr, data))
+
+            if not requests:
+                messagebox.showwarning("Empty Trace",
+                                       "No valid requests found in the file.",
+                                       parent=self.root)
+                return
+
+            self.request_list = requests
+            self._reset()
+            self._log(f"Imported {len(requests)} requests from {os.path.basename(path)}", "info")
+
+        except Exception as exc:
+            messagebox.showerror("Import Error",
+                                 f"Failed to parse trace file:\n{exc}",
+                                 parent=self.root)
+
+    # ------------------------------------------------------------------
     # Export simulation report
     # ------------------------------------------------------------------
 
@@ -1525,8 +1645,16 @@ class SimulatorGUI:
         total  = stats['total_requests'] or 1
         out.write(f"  Cache Hits     : {hits}  ({hits/total*100:.1f}%)\n")
         out.write(f"  Cache Misses   : {misses}  ({misses/total*100:.1f}%)\n")
+        out.write(f"    Compulsory   : {stats['compulsory_misses']}\n")
+        out.write(f"    Conflict     : {stats['conflict_misses']}\n")
         out.write(f"  Hit Rate       : {stats['hit_rate']}\n")
         out.write(f"  Total Cycles   : {stats['total_cycles']}\n")
+        out.write(f"  Stall Cycles   : {stats['stall_cycles']}\n")
+        out.write(f"  Bus Reads      : {stats['bus_reads']}  (allocations)\n")
+        out.write(f"  Bus Writes     : {stats['bus_writes']}  (write-backs)\n")
+        out.write(f"  Avg Miss Pen.  : {stats['avg_miss_penalty']} cycles\n")
+        out.write(f"  AMAT           : {stats['amat']} cycles  "
+                  f"(Hit Time + Miss Rate x Miss Penalty)\n")
 
         # ── request timeline ──────────────────────────────────────────
         out.write(section("REQUEST TIMELINE"))
@@ -1651,11 +1779,18 @@ class SimulatorGUI:
         # ── statistics ────────────────────────────────────────────────
         heading("Performance Statistics")
         w.writerow(["Metric", "Value"])
-        w.writerow(["Total Requests", stats["total_requests"]])
-        w.writerow(["Cache Hits",     stats["hits"]])
-        w.writerow(["Cache Misses",   stats["misses"]])
-        w.writerow(["Hit Rate",       stats["hit_rate"]])
-        w.writerow(["Total Cycles",   stats["total_cycles"]])
+        w.writerow(["Total Requests",    stats["total_requests"]])
+        w.writerow(["Cache Hits",        stats["hits"]])
+        w.writerow(["Cache Misses",      stats["misses"]])
+        w.writerow(["Compulsory Misses", stats["compulsory_misses"]])
+        w.writerow(["Conflict Misses",   stats["conflict_misses"]])
+        w.writerow(["Hit Rate",          stats["hit_rate"]])
+        w.writerow(["Total Cycles",      stats["total_cycles"]])
+        w.writerow(["Stall Cycles",      stats["stall_cycles"]])
+        w.writerow(["Bus Reads",         stats["bus_reads"]])
+        w.writerow(["Bus Writes",        stats["bus_writes"]])
+        w.writerow(["Avg Miss Penalty",  stats["avg_miss_penalty"]])
+        w.writerow(["AMAT (cycles)",     stats["amat"]])
 
         # ── request timeline ──────────────────────────────────────────
         heading("Request Timeline")

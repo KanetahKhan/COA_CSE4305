@@ -244,9 +244,16 @@ class Simulator:
         print(f"\n  {colorize('Performance Statistics:', 'BOLD')}")
         print(f"    Total Requests : {stats['total_requests']}")
         print(f"    Cache Hits     : {colorize(str(stats['hits']), 'GREEN')}")
-        print(f"    Cache Misses   : {colorize(str(stats['misses']), 'RED')}")
+        print(f"    Cache Misses   : {colorize(str(stats['misses']), 'RED')}"
+              f"  (compulsory: {stats['compulsory_misses']}"
+              f"  conflict: {stats['conflict_misses']})")
         print(f"    Hit Rate       : {colorize(stats['hit_rate'], 'CYAN')}")
         print(f"    Total Cycles   : {stats['total_cycles']}")
+        print(f"    Stall Cycles   : {stats['stall_cycles']}")
+        print(f"    Bus Reads      : {stats['bus_reads']}  (allocations)")
+        print(f"    Bus Writes     : {stats['bus_writes']}  (write-backs)")
+        print(f"    Avg Miss Pen.  : {colorize(str(stats['avg_miss_penalty']), 'YELLOW')} cycles")
+        print(f"    AMAT           : {colorize(str(stats['amat']), 'CYAN')} cycles")
 
     def _print_results(self):
         results = self.cpu.results

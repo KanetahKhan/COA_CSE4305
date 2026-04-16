@@ -592,6 +592,9 @@ class CompareWindow(tk.Toplevel):
         hit_a = sa["hits"] / max(sa["total_requests"], 1) * 100
         hit_b = sb["hits"] / max(sb["total_requests"], 1) * 100
 
+        amat_a = sa.get("amat", 0)
+        amat_b = sb.get("amat", 0)
+
         rows = [
             ("Hit Rate",      f"{hit_a:.1f}%",               f"{hit_b:.1f}%",
              _w(hit_a, hit_b, True)),
@@ -599,6 +602,14 @@ class CompareWindow(tk.Toplevel):
              _w(sa["hits"], sb["hits"], True)),
             ("Misses",        str(sa["misses"]),              str(sb["misses"]),
              _w(sa["misses"], sb["misses"], False)),
+            ("  Compulsory",  str(sa.get("compulsory_misses", 0)),
+                              str(sb.get("compulsory_misses", 0)),
+             _w(sa.get("compulsory_misses", 0), sb.get("compulsory_misses", 0), False)),
+            ("  Conflict",    str(sa.get("conflict_misses", 0)),
+                              str(sb.get("conflict_misses", 0)),
+             _w(sa.get("conflict_misses", 0), sb.get("conflict_misses", 0), False)),
+            ("AMAT (cycles)", str(amat_a),                    str(amat_b),
+             _w(amat_a, amat_b, False)),
             ("Total Cycles",  str(sa["total_cycles"]),        str(sb["total_cycles"]),
              _w(sa["total_cycles"], sb["total_cycles"], False)),
             ("Write-Backs",   str(res_a["write_backs"]),      str(res_b["write_backs"]),

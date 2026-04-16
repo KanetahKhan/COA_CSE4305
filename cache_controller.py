@@ -97,6 +97,18 @@ class CacheController:
         self.total_requests  = 0
         self.cycle           = 0
 
+        # Miss classification
+        self._seen_blocks     = set()   # blocks accessed at least once (for compulsory detection)
+        self.compulsory_misses = 0      # cold / first-access misses
+        self.conflict_misses   = 0      # replacement misses (block was evicted)
+
+        # Stall / bus tracking
+        self.stall_cycles      = 0      # cycles CPU is stalled
+        self.bus_reads         = 0      # memory read transactions (allocations)
+        self.bus_writes        = 0      # memory write transactions (write-backs)
+        self.total_miss_penalty = 0     # cumulative cycles spent servicing misses
+        self._miss_start_cycle  = 0     # cycle when current miss handling began
+
         self.log = []
 
     # ------------------------------------------------------------------
@@ -204,6 +216,9 @@ class CacheController:
         self.mem.read   = False
         self.mem.write  = False
 
+        if self.cpu.stall:
+            self.stall_cycles += 1
+
         if self.state == State.IDLE:
             self._handle_idle()
         elif self.state == State.COMPARE_TAG:
@@ -238,9 +253,12 @@ class CacheController:
         self.total_requests += 1
         hit_way = self._find_hit_way(set_idx, tag)
 
+        block_key = (tag, set_idx)
+
         if hit_way >= 0:
             # ---- HIT ----
             self.hits += 1
+            self._seen_blocks.add(block_key)
             line = self.cache[set_idx][hit_way]
             self._touch(set_idx, hit_way)         # update LRU stamp + access count
 
@@ -267,6 +285,12 @@ class CacheController:
         else:
             # ---- MISS ----
             self.misses   += 1
+            if block_key not in self._seen_blocks:
+                self.compulsory_misses += 1
+            else:
+                self.conflict_misses += 1
+            self._seen_blocks.add(block_key)
+            self._miss_start_cycle = self.cycle
             victim_way     = self._find_victim_way(set_idx)
             self.saved_set = set_idx
             self.saved_way = victim_way
@@ -304,6 +328,7 @@ class CacheController:
         self.wb_counter += 1
 
         if self.mem.ready:
+            self.bus_writes += 1
             self._log_event(
                 "WRITE_BACK_DONE",
                 f"Wrote block to mem addr=0x{wb_addr:04X} "
@@ -332,6 +357,8 @@ class CacheController:
         self.alloc_counter += 1
 
         if self.mem.ready:
+            self.bus_reads += 1
+            self.total_miss_penalty += (self.cycle - self._miss_start_cycle)
             line              = self.cache[set_idx][way]
             line.valid        = True
             line.tag          = tag
@@ -398,11 +425,27 @@ class CacheController:
         return snapshot
 
     def get_stats(self):
+        total  = self.total_requests or 1
+        miss_r = self.misses / total
+        hit_r  = self.hits / total
+        avg_miss_penalty = (self.total_miss_penalty / self.misses
+                            if self.misses else 0)
+        # AMAT = Hit Time + Miss Rate × Miss Penalty
+        # Hit Time = 1 cycle (compare-tag takes 1 cycle on hit)
+        amat = 1 + miss_r * avg_miss_penalty
+
         return {
-            "total_requests": self.total_requests,
-            "hits":           self.hits,
-            "misses":         self.misses,
-            "hit_rate":       f"{self.hits / self.total_requests * 100:.1f}%"
-                              if self.total_requests else "N/A",
-            "total_cycles":   self.cycle,
+            "total_requests":    self.total_requests,
+            "hits":              self.hits,
+            "misses":            self.misses,
+            "hit_rate":          f"{hit_r * 100:.1f}%"
+                                 if self.total_requests else "N/A",
+            "total_cycles":      self.cycle,
+            "compulsory_misses": self.compulsory_misses,
+            "conflict_misses":   self.conflict_misses,
+            "stall_cycles":      self.stall_cycles,
+            "bus_reads":         self.bus_reads,
+            "bus_writes":        self.bus_writes,
+            "avg_miss_penalty":  round(avg_miss_penalty, 1),
+            "amat":              round(amat, 2),
         }
