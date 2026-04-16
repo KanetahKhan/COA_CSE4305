@@ -1,4 +1,7 @@
-from cache_controller import CacheController, State, RequestType, Policy
+from cache_controller import (
+    CacheController, State, RequestType, Policy,
+    WritePolicy, AllocatePolicy,
+)
 from memory import Memory, HierarchicalMemory
 from cpu import CPU
 
@@ -17,10 +20,11 @@ COLORS = {
 }
 
 STATE_COLORS = {
-    State.IDLE:        COLORS["GREEN"],
-    State.COMPARE_TAG: COLORS["CYAN"],
-    State.WRITE_BACK:  COLORS["RED"],
-    State.ALLOCATE:    COLORS["YELLOW"],
+    State.IDLE:          COLORS["GREEN"],
+    State.COMPARE_TAG:   COLORS["CYAN"],
+    State.WRITE_BACK:    COLORS["RED"],
+    State.ALLOCATE:      COLORS["YELLOW"],
+    State.WRITE_THROUGH: COLORS["MAGENTA"],
 }
 
 
@@ -38,11 +42,17 @@ class Simulator:
                  associativity=1, policy=Policy.DIRECT,
                  base_cpi=1.0, write_buffer_size=4, verbose=True,
                  enable_l2=True, l2_num_lines=None, l2_latency=2,
-                 l2_associativity=1, l2_policy=Policy.DIRECT):
+                 l2_associativity=1, l2_policy=Policy.DIRECT,
+                 write_policy=WritePolicy.WRITE_BACK,
+                 allocate_policy=AllocatePolicy.WRITE_ALLOCATE,
+                 victim_cache_size=0):
         self.cache_ctrl = CacheController(
             num_cache_lines, block_size, addr_bits,
             associativity=associativity, policy=policy,
             base_cpi=base_cpi,
+            write_policy=write_policy,
+            allocate_policy=allocate_policy,
+            victim_cache_size=victim_cache_size,
         )
         self.enable_l2 = bool(enable_l2)
         self.l2_num_lines = (max(16, num_cache_lines * 2)
@@ -119,7 +129,8 @@ class Simulator:
 
             self.memory.tick()
 
-            completed_write = (self.memory.ready and self.memory.operation == "write")
+            completed_write = (self.memory.ready
+                               and self.memory.operation in ("write", "write_partial"))
             completed_write_addr = self.memory.address
             completed_write_data = list(self.memory.buffer)
 
@@ -150,6 +161,15 @@ class Simulator:
                 self.write_buffer.append(wb_entry)
                 self._max_wb_occupancy = max(self._max_wb_occupancy, len(self.write_buffer))
 
+            pw_entry = self.cache_ctrl.consume_enqueued_partial_write()
+            if pw_entry is not None and len(self.write_buffer) < self.write_buffer_size:
+                self.write_buffer.append({
+                    "address":  pw_entry["address"],
+                    "value":    pw_entry["value"],
+                    "partial":  True,
+                })
+                self._max_wb_occupancy = max(self._max_wb_occupancy, len(self.write_buffer))
+
             if prev_state != curr_state:
                 self._mem_op_started = False
 
@@ -169,8 +189,14 @@ class Simulator:
 
             elif (not self.memory.busy and self.write_buffer):
                 self._active_wb = self.write_buffer.pop(0)
-                self.memory.start_write(self._active_wb["address"],
-                                        self._active_wb["data"])
+                if self._active_wb.get("partial"):
+                    self.memory.start_write_partial(
+                        self._active_wb["address"],
+                        self._active_wb["value"],
+                    )
+                else:
+                    self.memory.start_write(self._active_wb["address"],
+                                            self._active_wb["data"])
                 self._mem_op_started = True
 
             if self.verbose:
@@ -205,12 +231,18 @@ class Simulator:
         while self.memory.busy or self.write_buffer:
             if not self.memory.busy and self.write_buffer:
                 self._active_wb = self.write_buffer.pop(0)
-                self.memory.start_write(self._active_wb["address"],
-                                        self._active_wb["data"])
+                if self._active_wb.get("partial"):
+                    self.memory.start_write_partial(
+                        self._active_wb["address"],
+                        self._active_wb["value"],
+                    )
+                else:
+                    self.memory.start_write(self._active_wb["address"],
+                                            self._active_wb["data"])
 
             self.memory.tick()
             self._sync_hierarchy_stats()
-            if self.memory.ready and self.memory.operation == "write":
+            if self.memory.ready and self.memory.operation in ("write", "write_partial"):
                 self.cache_ctrl.notify_writeback_completed(
                     self.memory.address,
                     list(self.memory.buffer),

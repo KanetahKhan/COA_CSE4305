@@ -24,7 +24,10 @@ import copy
 import csv
 import io
 import datetime
-from cache_controller import CacheController, State, RequestType, Policy
+from cache_controller import (
+    CacheController, State, RequestType, Policy,
+    WritePolicy, AllocatePolicy,
+)
 from memory import Memory, HierarchicalMemory
 from cpu import CPU
 from compare_window import CompareWindow
@@ -33,10 +36,11 @@ from dataflow_window import DataFlowWindow
 
 
 STATE_COLORS = {
-    State.IDLE:        "#a6e3a1",
-    State.COMPARE_TAG: "#89b4fa",
-    State.WRITE_BACK:  "#f38ba8",
-    State.ALLOCATE:    "#fab387",
+    State.IDLE:          "#a6e3a1",
+    State.COMPARE_TAG:   "#89b4fa",
+    State.WRITE_BACK:    "#f38ba8",
+    State.ALLOCATE:      "#fab387",
+    State.WRITE_THROUGH: "#cba6f7",
 }
 
 BG_COLOR   = "#11111b"
@@ -71,6 +75,18 @@ _POLICY_MAP = {
     "Random": Policy.RANDOM,
 }
 
+WRITE_POLICY_OPTIONS    = ["Write-Back", "Write-Through"]
+ALLOCATE_POLICY_OPTIONS = ["Write-Allocate", "No-Write-Allocate"]
+
+_WRITE_POLICY_MAP = {
+    "Write-Back":    WritePolicy.WRITE_BACK,
+    "Write-Through": WritePolicy.WRITE_THROUGH,
+}
+_ALLOCATE_POLICY_MAP = {
+    "Write-Allocate":    AllocatePolicy.WRITE_ALLOCATE,
+    "No-Write-Allocate": AllocatePolicy.NO_WRITE_ALLOCATE,
+}
+
 
 class SimulatorGUI:
     def __init__(self, root):
@@ -91,6 +107,9 @@ class SimulatorGUI:
         self._cfg_l2_latency = 2
         self._cfg_base_cpi   = 1.0
         self._cfg_wb_size    = 4
+        self._cfg_write_policy    = WritePolicy.WRITE_BACK
+        self._cfg_allocate_policy = AllocatePolicy.WRITE_ALLOCATE
+        self._cfg_victim_size     = 0
 
         # Simulation state
         self.cycle           = 0

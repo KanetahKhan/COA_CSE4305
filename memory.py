@@ -40,6 +40,18 @@ class Memory:
             self.address = address
             self.buffer = list(block_data)
 
+    def start_write_partial(self, address, value):
+        """Single-word write: only data[address] is updated. Used by
+        write-through and no-write-allocate paths to avoid corrupting other
+        words in the block."""
+        if not self.busy:
+            self.busy = True
+            self.ready = False
+            self.counter = 0
+            self.operation = "write_partial"
+            self.address = address
+            self.buffer = [int(value) & 0xFF] * self.block_size
+
     def tick(self):
         self.ready = False
 
@@ -60,6 +72,12 @@ class Memory:
             for i in range(self.block_size):
                 if base + i < len(self.data):
                     self.data[base + i] = self.buffer[i]
+            self.ready = True
+            self.busy = False
+
+        elif self.operation == "write_partial" and self.counter >= self.write_latency:
+            if self.address < len(self.data):
+                self.data[self.address] = self.buffer[0]
             self.ready = True
             self.busy = False
 
@@ -284,6 +302,8 @@ class HierarchicalMemory:
         self.l2_dirty_evictions = 0
         self.main_memory_reads = 0
         self.main_memory_writes = 0
+        self.partial_writes = 0
+        self._partial_word_offset = None
 
     @property
     def data(self):
@@ -346,6 +366,28 @@ class HierarchicalMemory:
         self.read_latency = (self.l2_latency + self.main_memory.read_latency
                              + (self.main_memory.write_latency if self._pending_victim else 0))
 
+    def start_write_partial(self, address, value):
+        """Single-word write that bypasses L2 (write-no-allocate / write-through
+        partial). Routes straight to main memory."""
+        if self.busy:
+            return
+
+        self.busy = True
+        self.ready = False
+        self.counter = 0
+        self.operation = "write_partial"
+        self.address = address
+        self.buffer = [int(value) & 0xFF] * self.block_size
+        self._phase_counter = 0
+        self._phase = "write_partial"
+        self._pending_block = None
+        self._pending_victim = None
+        self._prepared_fill = None
+        self.partial_writes += 1
+        self.write_latency = self.main_memory.write_latency
+        self.main_memory.start_write_partial(address, value)
+        self.main_memory_writes += 1
+
     def start_write(self, address, block_data):
         if self.busy:
             return
@@ -379,6 +421,14 @@ class HierarchicalMemory:
 
         self.counter += 1
         self._phase_counter += 1
+
+        if self._phase == "write_partial":
+            if not self.main_memory.ready:
+                return
+            self.ready = True
+            self.busy = False
+            self._clear_phase_state()
+            return
 
         if self._phase == "read_hit":
             if self._phase_counter >= self.l2_latency:

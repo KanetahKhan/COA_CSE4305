@@ -9,6 +9,7 @@ class State(Enum):
     COMPARE_TAG = "COMPARE_TAG"
     WRITE_BACK = "WRITE_BACK"
     ALLOCATE = "ALLOCATE"
+    WRITE_THROUGH = "WRITE_THROUGH"   # waiting for write-buffer room
 
 
 class RequestType(Enum):
@@ -21,6 +22,71 @@ class Policy(Enum):
     LRU    = "LRU"
     LFU    = "LFU"
     RANDOM = "Random"
+
+
+class WritePolicy(Enum):
+    WRITE_BACK    = "Write-Back"
+    WRITE_THROUGH = "Write-Through"
+
+
+class AllocatePolicy(Enum):
+    WRITE_ALLOCATE    = "Write-Allocate"
+    NO_WRITE_ALLOCATE = "No-Write-Allocate"
+
+
+class VictimCache:
+    """Small fully-associative FIFO buffer that catches recently evicted blocks."""
+
+    def __init__(self, size, block_size):
+        self.size = max(0, int(size))
+        self.block_size = block_size
+        self.entries = []          # FIFO list of dicts: tag, set, dirty, data
+        self.accesses = 0          # lookups (only when enabled)
+        self.hits = 0
+        self.swaps = 0             # successful victim->L1 swaps
+        self.installs = 0          # blocks pushed in from L1 evictions
+        self.dirty_evictions = 0   # FIFO-evicted dirty blocks needing write-back
+
+    @property
+    def enabled(self):
+        return self.size > 0
+
+    def lookup(self, tag, set_idx):
+        for i, entry in enumerate(self.entries):
+            if entry["tag"] == tag and entry["set"] == set_idx:
+                return i, entry
+        return -1, None
+
+    def remove(self, idx):
+        return self.entries.pop(idx)
+
+    def push(self, tag, set_idx, dirty, data):
+        """Insert a block; FIFO-evict the oldest if full. Returns evicted entry or None."""
+        evicted = None
+        if len(self.entries) >= self.size:
+            evicted = self.entries.pop(0)
+            if evicted["dirty"]:
+                self.dirty_evictions += 1
+        self.entries.append({
+            "tag": tag,
+            "set": set_idx,
+            "dirty": bool(dirty),
+            "data": list(data),
+        })
+        self.installs += 1
+        return evicted
+
+    def snapshot(self):
+        return [
+            {
+                "slot": i,
+                "tag": f"0x{e['tag']:X}",
+                "set": e["set"],
+                "dirty": e["dirty"],
+                "data": [f"0x{d:02X}" for d in e["data"]],
+            }
+            for i, e in enumerate(self.entries)
+        ]
 
 
 @dataclass
@@ -58,7 +124,10 @@ class MemoryInterface:
 class CacheController:
     def __init__(self, num_lines=8, block_size=4, addr_bits=16,
                  associativity=1, policy=Policy.DIRECT,
-                 base_cpi=1.0):
+                 base_cpi=1.0,
+                 write_policy=WritePolicy.WRITE_BACK,
+                 allocate_policy=AllocatePolicy.WRITE_ALLOCATE,
+                 victim_cache_size=0):
         self.num_lines = num_lines
         self.block_size = block_size
         self.addr_bits = addr_bits
@@ -68,6 +137,9 @@ class CacheController:
 
         self.num_sets = num_lines // self.associativity
         self.base_cpi = float(base_cpi)
+        self.write_policy = write_policy
+        self.allocate_policy = allocate_policy
+        self.victim_cache = VictimCache(victim_cache_size, block_size)
 
         self.offset_bits = (block_size - 1).bit_length()
         self.index_bits  = (self.num_sets - 1).bit_length()   # 0 when num_sets==1
@@ -86,6 +158,8 @@ class CacheController:
         self.mem = MemoryInterface()
         self._write_buffer_has_room = True
         self._pending_writeback_enqueue = None
+        # Write-through deferred enqueue: dict {address, value, offset} or None
+        self._pending_partial_write = None
 
         self.saved_address = 0
         self.saved_request = None
@@ -116,6 +190,11 @@ class CacheController:
         self.write_buffer_max_occupancy = 0
         self.write_buffer_size = 0
         self._hierarchy_stats = {}
+
+        self.write_through_writes = 0    # write-through propagations enqueued
+        self.no_allocate_bypass   = 0    # no-write-allocate writes that skipped L1
+        # Pending request that's mid-write-through (waiting for buffer)
+        self._pending_wt_complete = None
 
         self.log = []
 
@@ -221,6 +300,11 @@ class CacheController:
         self._pending_writeback_enqueue = None
         return wb
 
+    def consume_enqueued_partial_write(self):
+        pw = self._pending_partial_write
+        self._pending_partial_write = None
+        return pw
+
     def notify_writeback_completed(self, address, data):
         self.bus_writes += 1
         self._log_event(
@@ -248,6 +332,7 @@ class CacheController:
         self.mem.read   = False
         self.mem.write  = False
         self._pending_writeback_enqueue = None
+        self._pending_partial_write = None
 
         if self.cpu.stall:
             self.stall_cycles += 1
@@ -260,9 +345,155 @@ class CacheController:
             self._handle_write_back()
         elif self.state == State.ALLOCATE:
             self._handle_allocate()
+        elif self.state == State.WRITE_THROUGH:
+            self._handle_write_through()
 
     # ------------------------------------------------------------------
     # State handlers
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Write-through / victim cache helpers
+    # ------------------------------------------------------------------
+
+    def _begin_write_through(self, address, offset, value):
+        """Try to enqueue a write-through; defer to WRITE_THROUGH state if buffer full."""
+        if self._write_buffer_has_room:
+            self._pending_partial_write = {
+                "address": address,
+                "offset":  offset,
+                "value":   value,
+            }
+            self.write_through_writes += 1
+            self._log_event(
+                "WRITE_THROUGH_ENQUEUE",
+                f"Enqueued write-through addr=0x{address:04X} "
+                f"offset={offset} value=0x{value:02X}"
+            )
+            self.cpu.ready = True
+            self.cpu.stall = False
+            self.state     = State.IDLE
+        else:
+            self._pending_wt_complete = {
+                "address": address,
+                "offset":  offset,
+                "value":   value,
+            }
+            self._log_event(
+                "WRITE_BUFFER_FULL_WAIT",
+                f"Write-through deferred (buffer full) addr=0x{address:04X}"
+            )
+            self.state = State.WRITE_THROUGH
+
+    def _try_victim_swap(self, tag, set_idx, victim_way, offset):
+        """If the requested block lives in the victim cache, swap it back into L1
+        and complete the access. Returns True if handled."""
+        if not self.victim_cache.enabled:
+            return False
+        self.victim_cache.accesses += 1
+        idx, entry = self.victim_cache.lookup(tag, set_idx)
+        if entry is None:
+            return False
+
+        # Need room in the write buffer if the swap displaces a dirty L1 line
+        # AND the FIFO push would also evict a dirty victim entry.
+        evict_l1 = self.cache[set_idx][victim_way]
+        l1_dirty = evict_l1.valid and evict_l1.dirty
+        wb_pressure = (l1_dirty and self.victim_cache.size <= len(self.victim_cache.entries) - 1
+                       and any(e["dirty"] for e in self.victim_cache.entries[:1]))
+
+        # Be conservative: if the FIFO eviction could spill a dirty block to
+        # the write buffer, require buffer room for that one outgoing write.
+        if wb_pressure and not self._write_buffer_has_room:
+            self._log_event(
+                "VICTIM_DEFER",
+                "Victim swap deferred (write buffer full)"
+            )
+            return False
+
+        self.victim_cache.hits += 1
+        self.victim_cache.swaps += 1
+        # Remove victim entry; install its block into L1 at the chosen way.
+        self.victim_cache.remove(idx)
+        # Push the current L1 line (if valid) into the victim cache
+        evicted = None
+        if evict_l1.valid:
+            evicted = self.victim_cache.push(
+                evict_l1.tag, set_idx, evict_l1.dirty, evict_l1.data,
+            )
+        if evicted is not None and evicted["dirty"]:
+            ev_addr = self._block_address(evicted["tag"], evicted["set"])
+            self._pending_writeback_enqueue = {
+                "address": ev_addr,
+                "data": list(evicted["data"]),
+            }
+            self._log_event(
+                "VICTIM_FIFO_WRITEBACK",
+                f"Victim FIFO evicted dirty addr=0x{ev_addr:04X} -> write buffer"
+            )
+
+        new_line = self.cache[set_idx][victim_way]
+        new_line.valid       = True
+        new_line.tag         = tag
+        new_line.data        = list(entry["data"])
+        new_line.dirty       = entry["dirty"]
+        new_line.access_count = 0
+        new_line.write_count  = 0
+        self._touch(set_idx, victim_way)
+
+        wb_addr = self._block_address(tag, set_idx)
+        if self.saved_request == RequestType.READ:
+            self.cpu.data_out = new_line.data[offset]
+            self._log_event(
+                "VICTIM_HIT_READ",
+                f"Victim cache hit addr=0x{wb_addr:04X} "
+                f"-> swapped into L1 set={set_idx} way={victim_way} "
+                f"data=0x{new_line.data[offset]:02X}"
+            )
+            self.cpu.ready = True
+            self.cpu.stall = False
+            self.state     = State.IDLE
+        else:
+            new_line.data[offset] = self.saved_data
+            new_line.write_count += 1
+            if self.write_policy == WritePolicy.WRITE_THROUGH:
+                new_line.dirty = False
+                self._log_event(
+                    "VICTIM_HIT_WRITE_THROUGH",
+                    f"Victim cache hit addr=0x{wb_addr:04X} "
+                    f"-> swapped into L1, wrote=0x{self.saved_data:02X} "
+                    f"(forwarding to memory)"
+                )
+                self._begin_write_through(self.saved_address, offset, self.saved_data)
+            else:
+                new_line.dirty = True
+                self._log_event(
+                    "VICTIM_HIT_WRITE",
+                    f"Victim cache hit addr=0x{wb_addr:04X} "
+                    f"-> swapped into L1, wrote=0x{self.saved_data:02X} "
+                    f"(dirty=True)"
+                )
+                self.cpu.ready = True
+                self.cpu.stall = False
+                self.state     = State.IDLE
+        return True
+
+    def _push_victim_clean(self, line, set_idx):
+        """Push a clean L1 eviction into the victim cache. Dirty FIFO evictions
+        go to the write buffer."""
+        evicted = self.victim_cache.push(line.tag, set_idx, False, line.data)
+        if evicted is not None and evicted["dirty"]:
+            if self._write_buffer_has_room:
+                ev_addr = self._block_address(evicted["tag"], evicted["set"])
+                self._pending_writeback_enqueue = {
+                    "address": ev_addr,
+                    "data": list(evicted["data"]),
+                }
+                self._log_event(
+                    "VICTIM_FIFO_WRITEBACK",
+                    f"Victim FIFO evicted dirty addr=0x{ev_addr:04X} -> write buffer"
+                )
+
     # ------------------------------------------------------------------
 
     def _handle_idle(self):
@@ -302,18 +533,31 @@ class CacheController:
                     f"tag=0x{tag:X} set={set_idx} way={hit_way} offset={offset} "
                     f"data=0x{line.data[offset]:02X}"
                 )
+                self.cpu.ready = True
+                self.cpu.stall = False
+                self.state     = State.IDLE
             else:
                 line.data[offset] = self.saved_data
-                line.dirty = True
                 line.write_count += 1
-                self._log_event(
-                    "CACHE_HIT_WRITE",
-                    f"tag=0x{tag:X} set={set_idx} way={hit_way} offset={offset} "
-                    f"wrote=0x{self.saved_data:02X} (dirty=True)"
-                )
-            self.cpu.ready = True
-            self.cpu.stall = False
-            self.state     = State.IDLE
+                if self.write_policy == WritePolicy.WRITE_THROUGH:
+                    # Update L1 but stay clean; propagate to memory.
+                    line.dirty = False
+                    self._log_event(
+                        "CACHE_HIT_WRITE_THROUGH",
+                        f"tag=0x{tag:X} set={set_idx} way={hit_way} offset={offset} "
+                        f"wrote=0x{self.saved_data:02X} (forwarding to memory)"
+                    )
+                    self._begin_write_through(self.saved_address, offset, self.saved_data)
+                else:
+                    line.dirty = True
+                    self._log_event(
+                        "CACHE_HIT_WRITE",
+                        f"tag=0x{tag:X} set={set_idx} way={hit_way} offset={offset} "
+                        f"wrote=0x{self.saved_data:02X} (dirty=True)"
+                    )
+                    self.cpu.ready = True
+                    self.cpu.stall = False
+                    self.state     = State.IDLE
 
         else:
             # ---- MISS ----
@@ -324,9 +568,27 @@ class CacheController:
                 self.conflict_misses += 1
             self._seen_blocks.add(block_key)
             self._miss_start_cycle = self.cycle
+
+            # Write-miss with no-write-allocate: bypass L1, send write to memory.
+            if (self.saved_request == RequestType.WRITE
+                    and self.allocate_policy == AllocatePolicy.NO_WRITE_ALLOCATE):
+                self.no_allocate_bypass += 1
+                self._log_event(
+                    "CACHE_MISS_NO_ALLOCATE",
+                    f"tag=0x{tag:X} set={set_idx} offset={offset} "
+                    f"wrote=0x{self.saved_data:02X} (bypass — no L1 install)"
+                )
+                self._begin_write_through(self.saved_address, offset, self.saved_data)
+                return
+
             victim_way     = self._find_victim_way(set_idx)
             self.saved_set = set_idx
             self.saved_way = victim_way
+
+            # Victim cache: catch the requested block before going to L2/memory.
+            if self._try_victim_swap(tag, set_idx, victim_way, offset):
+                return
+
             victim_line    = self.cache[set_idx][victim_way]
 
             if victim_line.valid and victim_line.dirty:
@@ -341,6 +603,10 @@ class CacheController:
                 self.state = State.WRITE_BACK
             else:
                 self.alloc_counter = 0
+                # Push the (clean) evicted block into the victim cache too,
+                # if enabled and the line was previously valid.
+                if self.victim_cache.enabled and victim_line.valid:
+                    self._push_victim_clean(victim_line, set_idx)
                 self._log_event(
                     "CACHE_MISS_CLEAN",
                     f"tag=0x{tag:X} set={set_idx} way={victim_way} "
@@ -361,6 +627,32 @@ class CacheController:
             )
             return
 
+        # If victim cache is enabled, divert the dirty block there instead of
+        # straight to the write buffer. The block keeps its dirty flag in the
+        # victim cache; only a FIFO eviction triggers an actual write-back.
+        if self.victim_cache.enabled:
+            evicted = self.victim_cache.push(line.tag, set_idx, True, line.data)
+            self.victim_cache.swaps  # noqa: B018 (no-op; just to expose attr existence)
+            line.dirty = False
+            self.alloc_counter = 0
+            self._log_event(
+                "VICTIM_INSTALL_DIRTY",
+                f"Diverted dirty eviction to victim cache addr=0x{wb_addr:04X}"
+            )
+            if evicted is not None and evicted["dirty"]:
+                ev_addr = self._block_address(evicted["tag"], evicted["set"])
+                self._pending_writeback_enqueue = {
+                    "address": ev_addr,
+                    "data": list(evicted["data"]),
+                }
+                self._log_event(
+                    "VICTIM_FIFO_WRITEBACK",
+                    f"Victim FIFO evicted dirty addr=0x{ev_addr:04X} "
+                    f"-> write buffer"
+                )
+            self.state = State.ALLOCATE
+            return
+
         self._pending_writeback_enqueue = {
             "address": wb_addr,
             "data": list(line.data),
@@ -373,6 +665,36 @@ class CacheController:
             f"Enqueued dirty block addr=0x{wb_addr:04X} "
             f"data={[f'0x{d:02X}' for d in line.data]}"
         )
+
+    def _handle_write_through(self):
+        """Retry a deferred write-through enqueue (write buffer was full)."""
+        if not self._write_buffer_has_room:
+            self._log_event(
+                "WRITE_BUFFER_FULL_WAIT",
+                "Buffer full; cannot enqueue write-through"
+            )
+            return
+
+        info = self._pending_wt_complete
+        if info is None:
+            # Defensive: should not happen, but recover gracefully.
+            self.state = State.IDLE
+            return
+        self._pending_partial_write = {
+            "address": info["address"],
+            "offset":  info["offset"],
+            "value":   info["value"],
+        }
+        self.write_through_writes += 1
+        self._log_event(
+            "WRITE_THROUGH_ENQUEUE",
+            f"Enqueued write-through addr=0x{info['address']:04X} "
+            f"offset={info['offset']} value=0x{info['value']:02X}"
+        )
+        self._pending_wt_complete = None
+        self.cpu.ready = True
+        self.cpu.stall = False
+        self.state     = State.IDLE
 
     def _handle_allocate(self):
         tag, _, offset = self._decompose_address(self.saved_address)
@@ -406,20 +728,32 @@ class CacheController:
                     f"returned=0x{line.data[offset]:02X} "
                     f"(took {self.alloc_counter} cycles)"
                 )
+                self.cpu.ready = True
+                self.cpu.stall = False
+                self.state     = State.IDLE
             else:
                 line.data[offset] = self.saved_data
-                line.dirty        = True
                 line.write_count += 1
-                self._log_event(
-                    "ALLOCATE_DONE_WRITE",
-                    f"Fetched block from mem addr=0x{block_addr:04X} "
-                    f"then wrote=0x{self.saved_data:02X} at offset={offset} "
-                    f"(dirty=True, took {self.alloc_counter} cycles)"
-                )
-
-            self.cpu.ready = True
-            self.cpu.stall = False
-            self.state     = State.IDLE
+                if self.write_policy == WritePolicy.WRITE_THROUGH:
+                    line.dirty = False
+                    self._log_event(
+                        "ALLOCATE_DONE_WRITE_THROUGH",
+                        f"Fetched block from mem addr=0x{block_addr:04X} "
+                        f"then wrote=0x{self.saved_data:02X} at offset={offset} "
+                        f"(forwarding to memory, took {self.alloc_counter} cycles)"
+                    )
+                    self._begin_write_through(self.saved_address, offset, self.saved_data)
+                else:
+                    line.dirty = True
+                    self._log_event(
+                        "ALLOCATE_DONE_WRITE",
+                        f"Fetched block from mem addr=0x{block_addr:04X} "
+                        f"then wrote=0x{self.saved_data:02X} at offset={offset} "
+                        f"(dirty=True, took {self.alloc_counter} cycles)"
+                    )
+                    self.cpu.ready = True
+                    self.cpu.stall = False
+                    self.state     = State.IDLE
         else:
             self._log_event(
                 "ALLOCATE_WAIT",
@@ -515,6 +849,27 @@ class CacheController:
             "write_buffer_depth": self.write_buffer_depth,
             "write_buffer_max_occupancy": self.write_buffer_max_occupancy,
             "write_buffer_size": self.write_buffer_size,
+            "write_policy":       self.write_policy.value,
+            "allocate_policy":    self.allocate_policy.value,
+            "write_through_writes": self.write_through_writes,
+            "no_allocate_bypass": self.no_allocate_bypass,
+            "victim_cache_enabled": self.victim_cache.enabled,
+            "victim_cache_size":  self.victim_cache.size,
+            "victim_cache_depth": len(self.victim_cache.entries),
+            "victim_accesses":    self.victim_cache.accesses,
+            "victim_hits":        self.victim_cache.hits,
+            "victim_swaps":       self.victim_cache.swaps,
+            "victim_installs":    self.victim_cache.installs,
+            "victim_dirty_evictions": self.victim_cache.dirty_evictions,
+            "victim_hit_rate":    _pct(
+                (self.victim_cache.hits / self.victim_cache.accesses)
+                if self.victim_cache.accesses else 0,
+                self.victim_cache.accesses > 0,
+            ),
+            "victim_hit_rate_value": (
+                (self.victim_cache.hits / self.victim_cache.accesses)
+                if self.victim_cache.accesses else 0
+            ),
             "l1_hits":           self.hits,
             "l1_misses":         self.misses,
             "l1_hit_rate":       f"{hit_r * 100:.1f}%"
