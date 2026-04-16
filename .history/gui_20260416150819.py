@@ -1670,15 +1670,6 @@ class SimulatorGUI:
         out.write(f"  Avg Miss Pen.  : {stats['avg_miss_penalty']} cycles\n")
         out.write(f"  AMAT           : {stats['amat']} cycles  "
                   f"(Hit Time + Miss Rate x Miss Penalty)\n")
-        out.write("\n  CPI Impact Calculator (5-stage pipeline)\n")
-        out.write(f"    Base CPI       : {stats['base_cpi']}\n")
-        out.write(f"    Instructions   : {stats['instructions']}\n")
-        out.write(f"    Memory Stalls  : {stats['memory_stalls']}\n")
-        out.write(f"    Effective CPI  : {stats['effective_cpi']}"
-              f"  (= Base CPI + Memory Stalls / Instructions)\n")
-        out.write(f"    Throughput IPC : {stats['achieved_ipc']}"
-              f"  (ideal: {stats['ideal_ipc']}, "
-              f"{stats['throughput_ratio'] * 100:.1f}% of ideal)\n")
 
         # ── request timeline ──────────────────────────────────────────
         out.write(section("REQUEST TIMELINE"))
@@ -1815,14 +1806,6 @@ class SimulatorGUI:
         w.writerow(["Bus Writes",        stats["bus_writes"]])
         w.writerow(["Avg Miss Penalty",  stats["avg_miss_penalty"]])
         w.writerow(["AMAT (cycles)",     stats["amat"]])
-        w.writerow(["Base CPI",          stats["base_cpi"]])
-        w.writerow(["Instructions",      stats["instructions"]])
-        w.writerow(["Memory Stalls",     stats["memory_stalls"]])
-        w.writerow(["Effective CPI",     stats["effective_cpi"]])
-        w.writerow(["Ideal IPC",         stats["ideal_ipc"]])
-        w.writerow(["Achieved IPC",      stats["achieved_ipc"]])
-        w.writerow(["Throughput Ratio",  stats["throughput_ratio"]])
-        w.writerow(["Throughput Loss %", stats["throughput_loss_pct"]])
 
         # ── request timeline ──────────────────────────────────────────
         heading("Request Timeline")

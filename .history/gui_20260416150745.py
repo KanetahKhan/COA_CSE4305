@@ -1670,15 +1670,6 @@ class SimulatorGUI:
         out.write(f"  Avg Miss Pen.  : {stats['avg_miss_penalty']} cycles\n")
         out.write(f"  AMAT           : {stats['amat']} cycles  "
                   f"(Hit Time + Miss Rate x Miss Penalty)\n")
-        out.write("\n  CPI Impact Calculator (5-stage pipeline)\n")
-        out.write(f"    Base CPI       : {stats['base_cpi']}\n")
-        out.write(f"    Instructions   : {stats['instructions']}\n")
-        out.write(f"    Memory Stalls  : {stats['memory_stalls']}\n")
-        out.write(f"    Effective CPI  : {stats['effective_cpi']}"
-              f"  (= Base CPI + Memory Stalls / Instructions)\n")
-        out.write(f"    Throughput IPC : {stats['achieved_ipc']}"
-              f"  (ideal: {stats['ideal_ipc']}, "
-              f"{stats['throughput_ratio'] * 100:.1f}% of ideal)\n")
 
         # ── request timeline ──────────────────────────────────────────
         out.write(section("REQUEST TIMELINE"))
@@ -1815,14 +1806,6 @@ class SimulatorGUI:
         w.writerow(["Bus Writes",        stats["bus_writes"]])
         w.writerow(["Avg Miss Penalty",  stats["avg_miss_penalty"]])
         w.writerow(["AMAT (cycles)",     stats["amat"]])
-        w.writerow(["Base CPI",          stats["base_cpi"]])
-        w.writerow(["Instructions",      stats["instructions"]])
-        w.writerow(["Memory Stalls",     stats["memory_stalls"]])
-        w.writerow(["Effective CPI",     stats["effective_cpi"]])
-        w.writerow(["Ideal IPC",         stats["ideal_ipc"]])
-        w.writerow(["Achieved IPC",      stats["achieved_ipc"]])
-        w.writerow(["Throughput Ratio",  stats["throughput_ratio"]])
-        w.writerow(["Throughput Loss %", stats["throughput_loss_pct"]])
 
         # ── request timeline ──────────────────────────────────────────
         heading("Request Timeline")
@@ -1945,7 +1928,6 @@ class SimulatorGUI:
         v_addr   = tk.IntVar(value=self._cfg_addr_bits)
         v_rdlat  = tk.IntVar(value=self._cfg_read_lat)
         v_wrlat  = tk.IntVar(value=self._cfg_write_lat)
-        v_base_cpi = tk.DoubleVar(value=self._cfg_base_cpi)
 
         def lbl(parent, text, fg=DIM):
             return tk.Label(parent, text=text, bg=PANEL_BG, fg=fg,
@@ -2012,22 +1994,6 @@ class SimulatorGUI:
         lbl(lsect, "Write latency (cycles)").grid(row=2, column=0, sticky=tk.W, **pad)
         spinbox(lsect, v_wrlat).grid(row=2, column=1, sticky=tk.W)
 
-        lbl(lsect, "Base CPI (5-stage)").grid(row=3, column=0, sticky=tk.W, **pad)
-        base_cpi_entry = tk.Entry(lsect, width=6, bg="#45475a", fg=TEXT_COLOR,
-                                  font=("Consolas", 9), insertbackground=TEXT_COLOR,
-                                  relief=tk.FLAT)
-        base_cpi_entry.insert(0, f"{self._cfg_base_cpi:.2f}")
-        base_cpi_entry.grid(row=3, column=1, sticky=tk.W)
-
-        def sync_base_cpi(_e=None):
-            try:
-                v_base_cpi.set(float(base_cpi_entry.get().strip()))
-            except ValueError:
-                pass
-
-        base_cpi_entry.bind("<KeyRelease>", lambda _e: (sync_base_cpi(), refresh_preview()))
-        base_cpi_entry.bind("<FocusOut>", lambda _e: sync_base_cpi())
-
         # Section: Live bit-field preview
         prev_frame = tk.Frame(outer, bg=PANEL_BG, padx=10, pady=8)
         prev_frame.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(0, 6))
@@ -2075,8 +2041,6 @@ class SimulatorGUI:
                     errors.append("⚠ Too many index/offset bits — tag would be < 1 bit.")
                 if nl < assoc:
                     errors.append(f"⚠ Lines ({nl}) < current associativity ({assoc}).")
-                if float(v_base_cpi.get()) <= 0:
-                    errors.append("⚠ Base CPI must be > 0.")
                 warn_lbl.configure(text="\n".join(errors))
                 apply_btn.configure(state=tk.NORMAL if not errors else tk.DISABLED)
             except Exception:
@@ -2105,7 +2069,6 @@ class SimulatorGUI:
                                   int(v_lines.get()), int(v_block.get()),
                                   int(v_addr.get()),  int(v_rdlat.get()),
                                   int(v_wrlat.get()),
-                                  float(v_base_cpi.get()),
                               ),
                               bg="#45475a", fg=GREEN,
                               font=("Consolas", 9, "bold"),
@@ -2119,7 +2082,7 @@ class SimulatorGUI:
         dlg.geometry(f"+{mx}+{my}")
 
     def _apply_settings(self, dlg, num_lines, block_size, addr_bits,
-                        read_lat, write_lat, base_cpi):
+                        read_lat, write_lat):
         """Validate, store config, close dialog, reset simulation."""
         assoc = self._current_associativity()
 
@@ -2144,19 +2107,12 @@ class SimulatorGUI:
                 "Reduce associativity first (in the main window).",
                 parent=dlg)
             return
-        if base_cpi <= 0:
-            messagebox.showerror(
-                "Invalid Configuration",
-                "Base CPI must be greater than 0.",
-                parent=dlg)
-            return
 
         self._cfg_num_lines  = num_lines
         self._cfg_block_size = block_size
         self._cfg_addr_bits  = addr_bits
         self._cfg_read_lat   = read_lat
         self._cfg_write_lat  = write_lat
-        self._cfg_base_cpi   = base_cpi
 
         dlg.destroy()
         self._reset()
